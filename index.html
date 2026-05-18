@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DIGIPACK SMART FLOOR</title>
-  <link rel="manifest" href="/manifest.json?v=11">
+  <link rel="manifest" href="/manifest.json?v=12">
   <meta name="theme-color" content="#111827">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
@@ -201,38 +201,17 @@
     }
 
     async function saveLabel(file, jobId, pkaNumber, labelType) {
-      const fileExt = (file.name || "label.jpg").split(".").pop();
-      const safeFileName = `${jobId}/${Date.now()}-${labelType}.${fileExt}`;
-      const { error: uploadError } = await client.storage.from("labels").upload(safeFileName, file, { upsert: true });
-
+      const fileName = `${jobId}/${Date.now()}-${file.name}`;
+      const { error: uploadError } = await client.storage.from("labels").upload(fileName, file);
       let imageUrl = "";
-      let uploadStatus = "uploaded";
-
-      if (uploadError) {
-        uploadStatus = "upload_error: " + uploadError.message;
-      } else {
-        const { data } = client.storage.from("labels").getPublicUrl(safeFileName);
-        imageUrl = data?.publicUrl || "";
-        if (!imageUrl) uploadStatus = "no_public_url";
+      if (!uploadError) {
+        const { data } = client.storage.from("labels").getPublicUrl(fileName);
+        imageUrl = data.publicUrl;
       }
-
-      const { error: insertError } = await client.from("material_labels").insert({
-        job_id: jobId,
-        batch_number: pkaNumber,
-        label_type: labelType,
-        image_url: imageUrl,
-        file_path: safeFileName,
-        comments: uploadStatus
-      });
-
-      if (insertError) {
-        console.error("material_labels insert error", insertError);
-      }
-
-      return imageUrl;
+      await client.from("material_labels").insert({ job_id: jobId, batch_number: pkaNumber, label_type: labelType, image_url: imageUrl });
     }
 
-    function renderActiveJob() {    function renderActiveJob() {
+    function renderActiveJob() {
       page(`
         ${topBar("עבודה פעילה", `פק״ע: ${currentJob.batch_number}`)}
         <section class="grid gap-4">
@@ -336,7 +315,6 @@
       return { start: start.toISOString(), end: end.toISOString() };
     }
 
-
     function escapeHtml(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -346,135 +324,19 @@
         .replaceAll("'", "&#039;");
     }
 
-    async function refreshEmployeesAdmin() {
-      const tbody = document.getElementById("employeesTableBody");
-      const msg = document.getElementById("employeesMsg");
-      if (!tbody) return;
-
-      tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">טוען עובדים...</td></tr>`;
-
-      const { data, error } = await client
-        .from("employees")
-        .select("*")
-        .order("name");
-
-      if (error) {
-        tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-red-400">${escapeHtml(error.message)}</td></tr>`;
-        if (msg) msg.innerText = "שגיאה בטעינת עובדים";
-        return;
-      }
-
-      if (!data.length) {
-        tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">אין עובדים במערכת</td></tr>`;
-        return;
-      }
-
-      tbody.innerHTML = data.map(emp => `
-        <tr>
-          <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(emp.name)}</td>
-          <td class="border border-gray-700 p-2 whitespace-nowrap">${emp.role === "manager" ? "מנהל" : "עובד"}</td>
-          <td class="border border-gray-700 p-2 whitespace-nowrap">${emp.active ? "פעיל" : "לא פעיל"}</td>
-          <td class="border border-gray-700 p-2">
-            <input id="pwd_${emp.id}" type="text" placeholder="סיסמה חדשה" class="w-full min-w-40 p-2 rounded-xl bg-gray-800 border border-gray-700">
-          </td>
-          <td class="border border-gray-700 p-2 whitespace-nowrap">
-            <button onclick="updateEmployeePassword('${emp.id}')" class="bg-blue-600 px-3 py-2 rounded-xl text-sm font-bold">עדכן סיסמה</button>
-            <button onclick="toggleEmployeeActive('${emp.id}', ${emp.active ? "false" : "true"})" class="bg-orange-600 px-3 py-2 rounded-xl text-sm font-bold">${emp.active ? "השבת" : "הפעל"}</button>
-            <button onclick="setEmployeeRole('${emp.id}', '${emp.role === "manager" ? "operator" : "manager"}')" class="bg-purple-600 px-3 py-2 rounded-xl text-sm font-bold">${emp.role === "manager" ? "הפוך לעובד" : "הפוך למנהל"}</button>
-          </td>
-        </tr>
-      `).join("");
-      if (msg) msg.innerText = "";
-    }
-
-    async function createEmployeeAdmin() {
-      const msg = document.getElementById("employeesMsg");
-      const name = document.getElementById("newEmployeeName").value.trim();
-      const password = document.getElementById("newEmployeePassword").value.trim();
-      const role = document.getElementById("newEmployeeRole").value;
-
-      if (!name) { msg.innerText = "חובה להזין שם עובד"; return; }
-      if (!password) { msg.innerText = "חובה להזין סיסמה"; return; }
-
-      const { error } = await client.from("employees").insert({
-        name,
-        password,
-        role,
-        active: true
-      });
-
-      if (error) { msg.innerText = "שגיאה ביצירת עובד: " + error.message; return; }
-
-      document.getElementById("newEmployeeName").value = "";
-      document.getElementById("newEmployeePassword").value = "";
-      document.getElementById("newEmployeeRole").value = "operator";
-      msg.innerText = "העובד נוצר בהצלחה";
-      await refreshEmployeesAdmin();
-    }
-
-    async function updateEmployeePassword(employeeId) {
-      const msg = document.getElementById("employeesMsg");
-      const input = document.getElementById("pwd_" + employeeId);
-      const password = input.value.trim();
-
-      if (!password) { msg.innerText = "הזן סיסמה חדשה"; return; }
-
-      const { error } = await client
-        .from("employees")
-        .update({ password })
-        .eq("id", employeeId);
-
-      if (error) { msg.innerText = "שגיאה בעדכון סיסמה: " + error.message; return; }
-
-      input.value = "";
-      msg.innerText = "הסיסמה עודכנה";
-      await refreshEmployeesAdmin();
-    }
-
-    async function toggleEmployeeActive(employeeId, active) {
-      const msg = document.getElementById("employeesMsg");
-
-      const { error } = await client
-        .from("employees")
-        .update({ active })
-        .eq("id", employeeId);
-
-      if (error) { msg.innerText = "שגיאה בעדכון סטטוס עובד: " + error.message; return; }
-
-      msg.innerText = active ? "העובד הופעל" : "העובד הושבת";
-      await refreshEmployeesAdmin();
-    }
-
-    async function setEmployeeRole(employeeId, role) {
-      const msg = document.getElementById("employeesMsg");
-
-      const { error } = await client
-        .from("employees")
-        .update({ role })
-        .eq("id", employeeId);
-
-      if (error) { msg.innerText = "שגיאה בעדכון הרשאה: " + error.message; return; }
-
-      msg.innerText = "ההרשאה עודכנה";
-      await refreshEmployeesAdmin();
-    }
-
-
     async function sendDailyReportNow() {
       const msg = document.getElementById("emailStatusMsg");
       if (!msg) return;
-
       msg.innerText = "שולח דוח עכשיו...";
       try {
         const response = await fetch("/api/daily-report?manual=1", { method: "POST" });
         const result = await response.json();
-
         if (!response.ok || !result.ok) {
           msg.innerText = "שגיאה בשליחת דוח: " + (result.error || "שגיאה לא ידועה");
           return;
         }
-
-        msg.innerText = `הדוח נשלח בהצלחה אל ${Array.isArray(result.sentTo) ? result.sentTo.join(", ") : result.sentTo}. רשומות: ${result.rows}`;
+        const sentTo = Array.isArray(result.sentTo) ? result.sentTo.join(", ") : result.sentTo;
+        msg.innerText = "הדוח נשלח בהצלחה אל " + sentTo + ". רשומות: " + result.rows;
       } catch (err) {
         msg.innerText = "שגיאה בשליחה: " + err.message;
       }
@@ -482,7 +344,7 @@
 
     function renderManager() {
       page(`
-        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V11`)}
+        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V12`)}
         <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
           <h2 class="text-xl font-bold mb-4">בחירת תקופה</h2>
           <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -493,40 +355,10 @@
             <button type="button" onclick="window.loadReport('year')" class="bg-gray-700 p-4 rounded-2xl font-bold">שנה</button>
           </div>
           <button type="button" onclick="window.exportExcel()" class="w-full mt-4 bg-green-600 p-4 rounded-2xl font-bold">פתח / הורד Excel</button>
-          <p class="text-gray-400 text-sm mt-3">הדוח מוצג כאן באפליקציה. כפתור Excel יפתח או יוריד את הקובץ לפי הגדרות המכשיר.</p><p class="text-yellow-300 text-sm mt-2">שים לב: שליחה אוטומטית בחצות מוגדרת ב־Vercel Cron ותישלח אל yossi@digipack.co.il ו־renana@digipack.co.il לאחר הגדרת כל משתני הסביבה ב־Vercel.</p><button onclick="sendDailyReportNow()" class="w-full mt-4 bg-purple-600 p-4 rounded-2xl font-bold">שלח דוח עכשיו לבדיקה</button><p id="emailStatusMsg" class="text-yellow-300 text-sm mt-3"></p>
-        </section>
-
-        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
-          <h2 class="text-xl font-bold mb-4">ניהול עובדים והרשאות</h2>
-
-          <div class="grid md:grid-cols-4 gap-3 mb-5">
-            <input id="newEmployeeName" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="שם עובד חדש">
-            <input id="newEmployeePassword" type="text" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="סיסמה">
-            <select id="newEmployeeRole" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700">
-              <option value="operator">עובד</option>
-              <option value="manager">מנהל</option>
-            </select>
-            <button onclick="createEmployeeAdmin()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">צור עובד</button>
-          </div>
-
-          <p id="employeesMsg" class="text-yellow-300 mb-4"></p>
-
-          <div class="overflow-auto">
-            <table class="w-full text-sm border-collapse">
-              <thead>
-                <tr>
-                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">שם עובד</th>
-                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">הרשאה</th>
-                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">סטטוס</th>
-                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">סיסמה חדשה</th>
-                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">פעולות</th>
-                </tr>
-              </thead>
-              <tbody id="employeesTableBody">
-                <tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">טוען עובדים...</td></tr>
-              </tbody>
-            </table>
-          </div>
+          <button type="button" onclick="window.sendDailyReportNow()" class="w-full mt-4 bg-purple-600 p-4 rounded-2xl font-bold">שלח דוח עכשיו לבדיקה</button>
+          <p id="emailStatusMsg" class="text-yellow-300 text-sm mt-3"></p>
+          <p class="text-yellow-300 text-sm mt-2">שליחה אוטומטית בחצות מוגדרת דרך Vercel Cron ותישלח אל yossi@digipack.co.il ו־renana@digipack.co.il לאחר הגדרת משתני הסביבה.</p>
+          <p class="text-gray-400 text-sm mt-3">הדוח מוצג כאן באפליקציה. כפתור Excel יפתח או יוריד את הקובץ לפי הגדרות המכשיר.</p>
         </section>
 
         <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 overflow-auto">
@@ -535,7 +367,6 @@
           <div id="reportTable"></div>
         </section>`);
       loadReport("today");
-      refreshEmployeesAdmin();
     }
 
     async function loadReport(period) {
@@ -575,9 +406,8 @@
 
       reportRows = (jobs || []).map(job => {
         const labels = labelsByJob[job.id] || [];
-        const firstStartLabel = labels.find(l => l.label_type === "start" && l.image_url)?.image_url || "";
-        const extraLabels = labels.filter(l => l.label_type !== "start" && l.image_url).map(l => l.image_url);
-        const allLabelLinks = labels.filter(l => l.image_url).map(l => l.image_url);
+        const labelLinks = labels.filter(l => l.image_url).map(l => l.image_url);
+        const firstStartLabel = labels.find(l => l.label_type === "start" && l.image_url)?.image_url || labelLinks[0] || "";
 
         return {
           "תאריך": job.created_at ? new Date(job.created_at).toLocaleDateString("he-IL") : "",
@@ -587,7 +417,7 @@
           "פק״ע": job.batch_number || job.order_number || "",
           "כמות מטרים להעברה": job.transfer_meters || "",
           "תווית חו״ג ראשית": firstStartLabel,
-          "כל תוויות חו״ג": allLabelLinks.length ? allLabelLinks.join(" | ") : (labels.length ? "נמצאה תווית אבל אין קישור — בדוק הרשאת Storage bucket labels" : "")
+          "כל תוויות חו״ג": labelLinks.join(" | ")
         };
       });
 
@@ -602,10 +432,10 @@
         return;
       }
 
-      function renderCell(c, value) {
-        if ((c.includes("תווית") || c.includes("קישור")) && value) {
+      function renderCell(col, value) {
+        if ((col.includes("תווית") || col.includes("קישור")) && value) {
           const links = String(value).split(" | ").filter(Boolean);
-          return links.map((url, index) => `<a class="text-blue-400 underline" href="${url}" target="_blank">פתח${links.length > 1 ? " " + (index + 1) : ""}</a>`).join(" / ");
+          return links.map((url, i) => `<a class="text-blue-400 underline" href="${url}" target="_blank">פתח${links.length > 1 ? " " + (i + 1) : ""}</a>`).join(" / ");
         }
         return escapeHtml(value || "");
       }
@@ -619,23 +449,18 @@
 
     function exportExcel() {
       if (!reportRows.length) { alert("אין נתונים לייצוא"); return; }
-      const ws = XLSX.utils.json_to_sheet(reportRows, { header: ["תאריך", "שעת סיום", "שם מפעיל", "תהליך", "פק״ע", "כמות מטרים להעברה", "תווית חו״ג ראשית", "כל תוויות חו״ג"] });
+      const headers = ["תאריך", "שעת סיום", "שם מפעיל", "תהליך", "פק״ע", "כמות מטרים להעברה", "תווית חו״ג ראשית", "כל תוויות חו״ג"];
+      const ws = XLSX.utils.json_to_sheet(reportRows, { header: headers });
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "דוח מנהל");
       const today = new Date().toISOString().slice(0,10);
       XLSX.writeFile(wb, `digipack-manager-report-${today}.xlsx`);
     }
 
-    window.createEmployeeAdmin = createEmployeeAdmin;
-    window.updateEmployeePassword = updateEmployeePassword;
-    window.toggleEmployeeActive = toggleEmployeeActive;
-    window.setEmployeeRole = setEmployeeRole;
-    window.refreshEmployeesAdmin = refreshEmployeesAdmin;
-    window.sendDailyReportNow = sendDailyReportNow;
     window.loadReport = loadReport;
     window.exportExcel = exportExcel;
     window.renderLogin = renderLogin;
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=11");
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=12");
     renderLogin();
   </script>
 </body>

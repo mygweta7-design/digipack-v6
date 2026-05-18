@@ -1,6 +1,6 @@
 {
-  "name": "digipack-v9-auto-email",
-  "version": "9.0.0",
+  "name": "digipack-v12-stable",
+  "version": "12.0.0",
   "private": true,
   "type": "module",
   "dependencies": {
