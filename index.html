@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DIGIPACK SMART FLOOR</title>
-  <link rel="manifest" href="/manifest.json?v=10fix">
+  <link rel="manifest" href="/manifest.json?v=11">
   <meta name="theme-color" content="#111827">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
@@ -201,17 +201,38 @@
     }
 
     async function saveLabel(file, jobId, pkaNumber, labelType) {
-      const fileName = `${jobId}/${Date.now()}-${file.name}`;
-      const { error: uploadError } = await client.storage.from("labels").upload(fileName, file);
+      const fileExt = (file.name || "label.jpg").split(".").pop();
+      const safeFileName = `${jobId}/${Date.now()}-${labelType}.${fileExt}`;
+      const { error: uploadError } = await client.storage.from("labels").upload(safeFileName, file, { upsert: true });
+
       let imageUrl = "";
-      if (!uploadError) {
-        const { data } = client.storage.from("labels").getPublicUrl(fileName);
-        imageUrl = data.publicUrl;
+      let uploadStatus = "uploaded";
+
+      if (uploadError) {
+        uploadStatus = "upload_error: " + uploadError.message;
+      } else {
+        const { data } = client.storage.from("labels").getPublicUrl(safeFileName);
+        imageUrl = data?.publicUrl || "";
+        if (!imageUrl) uploadStatus = "no_public_url";
       }
-      await client.from("material_labels").insert({ job_id: jobId, batch_number: pkaNumber, label_type: labelType, image_url: imageUrl });
+
+      const { error: insertError } = await client.from("material_labels").insert({
+        job_id: jobId,
+        batch_number: pkaNumber,
+        label_type: labelType,
+        image_url: imageUrl,
+        file_path: safeFileName,
+        comments: uploadStatus
+      });
+
+      if (insertError) {
+        console.error("material_labels insert error", insertError);
+      }
+
+      return imageUrl;
     }
 
-    function renderActiveJob() {
+    function renderActiveJob() {    function renderActiveJob() {
       page(`
         ${topBar("עבודה פעילה", `פק״ע: ${currentJob.batch_number}`)}
         <section class="grid gap-4">
@@ -438,9 +459,30 @@
       await refreshEmployeesAdmin();
     }
 
+
+    async function sendDailyReportNow() {
+      const msg = document.getElementById("emailStatusMsg");
+      if (!msg) return;
+
+      msg.innerText = "שולח דוח עכשיו...";
+      try {
+        const response = await fetch("/api/daily-report?manual=1", { method: "POST" });
+        const result = await response.json();
+
+        if (!response.ok || !result.ok) {
+          msg.innerText = "שגיאה בשליחת דוח: " + (result.error || "שגיאה לא ידועה");
+          return;
+        }
+
+        msg.innerText = `הדוח נשלח בהצלחה אל ${Array.isArray(result.sentTo) ? result.sentTo.join(", ") : result.sentTo}. רשומות: ${result.rows}`;
+      } catch (err) {
+        msg.innerText = "שגיאה בשליחה: " + err.message;
+      }
+    }
+
     function renderManager() {
       page(`
-        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V10-FIX`)}
+        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V11`)}
         <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
           <h2 class="text-xl font-bold mb-4">בחירת תקופה</h2>
           <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -451,7 +493,7 @@
             <button type="button" onclick="window.loadReport('year')" class="bg-gray-700 p-4 rounded-2xl font-bold">שנה</button>
           </div>
           <button type="button" onclick="window.exportExcel()" class="w-full mt-4 bg-green-600 p-4 rounded-2xl font-bold">פתח / הורד Excel</button>
-          <p class="text-gray-400 text-sm mt-3">הדוח מוצג כאן באפליקציה. כפתור Excel יפתח או יוריד את הקובץ לפי הגדרות המכשיר.</p><p class="text-yellow-300 text-sm mt-2">שים לב: שליחה אוטומטית בחצות מוגדרת ב־Vercel Cron ותישלח אל yossi@digipack.co.il ו־renana@digipack.co.il לאחר הגדרת RESEND_API_KEY.</p>
+          <p class="text-gray-400 text-sm mt-3">הדוח מוצג כאן באפליקציה. כפתור Excel יפתח או יוריד את הקובץ לפי הגדרות המכשיר.</p><p class="text-yellow-300 text-sm mt-2">שים לב: שליחה אוטומטית בחצות מוגדרת ב־Vercel Cron ותישלח אל yossi@digipack.co.il ו־renana@digipack.co.il לאחר הגדרת כל משתני הסביבה ב־Vercel.</p><button onclick="sendDailyReportNow()" class="w-full mt-4 bg-purple-600 p-4 rounded-2xl font-bold">שלח דוח עכשיו לבדיקה</button><p id="emailStatusMsg" class="text-yellow-300 text-sm mt-3"></p>
         </section>
 
         <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
@@ -545,7 +587,7 @@
           "פק״ע": job.batch_number || job.order_number || "",
           "כמות מטרים להעברה": job.transfer_meters || "",
           "תווית חו״ג ראשית": firstStartLabel,
-          "כל תוויות חו״ג": allLabelLinks.join(" | ")
+          "כל תוויות חו״ג": allLabelLinks.length ? allLabelLinks.join(" | ") : (labels.length ? "נמצאה תווית אבל אין קישור — בדוק הרשאת Storage bucket labels" : "")
         };
       });
 
@@ -589,10 +631,11 @@
     window.toggleEmployeeActive = toggleEmployeeActive;
     window.setEmployeeRole = setEmployeeRole;
     window.refreshEmployeesAdmin = refreshEmployeesAdmin;
+    window.sendDailyReportNow = sendDailyReportNow;
     window.loadReport = loadReport;
     window.exportExcel = exportExcel;
     window.renderLogin = renderLogin;
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=10fix");
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=11");
     renderLogin();
   </script>
 </body>
