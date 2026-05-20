@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DIGIPACK SMART FLOOR</title>
-  <link rel="manifest" href="/manifest.json?v=14">
+  <link rel="manifest" href="/manifest.json?v=15">
   <meta name="theme-color" content="#111827">
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
@@ -200,10 +200,16 @@
       renderActiveJob();
     }
 
+    function buildPublicLabelUrl(fileName) {
+      const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
+      return `${SUPABASE_URL}/storage/v1/object/public/labels/${encodedPath}`;
+    }
+
     async function saveLabel(file, jobId, pkaNumber, labelType) {
       const originalName = file.name || "label.jpg";
       const ext = originalName.includes(".") ? originalName.split(".").pop() : "jpg";
       const fileName = `${jobId}/${Date.now()}-${labelType}.${ext}`;
+      const publicUrl = buildPublicLabelUrl(fileName);
 
       const { error: uploadError } = await client.storage
         .from("labels")
@@ -215,21 +221,40 @@
 
       if (uploadError) {
         console.error("שגיאה בהעלאת תווית:", uploadError);
+        alert("שגיאה בהעלאת תווית ל-Storage: " + uploadError.message);
+        return "";
       }
 
-      const { data } = client.storage.from("labels").getPublicUrl(fileName);
-      const publicUrl = data?.publicUrl || `${SUPABASE_URL}/storage/v1/object/public/labels/${fileName}`;
-
-      const { error: insertError } = await client.from("material_labels").insert({
+      const payload = {
         job_id: jobId,
         batch_number: pkaNumber,
         label_type: labelType,
-        image_url: publicUrl,
-        file_path: fileName
-      });
+        image_url: publicUrl
+      };
+
+      const { data: insertedRows, error: insertError } = await client
+        .from("material_labels")
+        .insert(payload)
+        .select();
 
       if (insertError) {
         console.error("שגיאה בשמירת רשומת תווית:", insertError);
+        alert("התמונה עלתה, אבל שמירת קישור התווית נכשלה: " + insertError.message);
+        return publicUrl;
+      }
+
+      const inserted = Array.isArray(insertedRows) ? insertedRows[0] : null;
+
+      if (inserted && inserted.id && !inserted.image_url) {
+        const { error: updateError } = await client
+          .from("material_labels")
+          .update({ image_url: publicUrl })
+          .eq("id", inserted.id);
+
+        if (updateError) {
+          console.error("שגיאה בעדכון image_url:", updateError);
+          alert("התמונה עלתה, אבל עדכון image_url נכשל: " + updateError.message);
+        }
       }
 
       return publicUrl;
@@ -465,7 +490,7 @@
 
     function renderManager() {
       page(`
-        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V14`)}
+        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V15`)}
         <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
           <h2 class="text-xl font-bold mb-4">בחירת תקופה</h2>
           <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -558,7 +583,9 @@
 
       reportRows = (jobs || []).map(job => {
         const labels = labelsByJob[job.id] || [];
-        const labelLinks = labels.filter(l => l.image_url).map(l => l.image_url);
+        const labelLinks = labels
+          .map(l => l.image_url || (l.file_path ? buildPublicLabelUrl(l.file_path) : ""))
+          .filter(Boolean);
         const firstStartLabel = labels.find(l => l.label_type === "start" && l.image_url)?.image_url || labelLinks[0] || "";
 
         return {
@@ -617,7 +644,7 @@
     window.loadReport = loadReport;
     window.exportExcel = exportExcel;
     window.renderLogin = renderLogin;
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=14");
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=15");
     renderLogin();
   </script>
 </body>
