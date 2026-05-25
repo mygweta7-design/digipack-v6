@@ -1,0 +1,1051 @@
+
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DIGIPACK SMART FLOOR</title>
+  <link rel="manifest" href="/manifest.json?v=21">
+  <meta name="theme-color" content="#111827">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <style>
+    @media print {
+      body { background: white !important; color: black !important; }
+      header, button, input, #reportTable, #employeesTableBody, #reportSummary { display: none !important; }
+      #qrLabelsContainer { display: grid !important; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+      .qr-label { page-break-inside: avoid; border: 1px solid #ccc !important; }
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-white min-h-screen">
+  <div id="app"></div>
+
+  <script>
+    const SUPABASE_URL = "https://elxfkcwyfmgqysfcfhwy.supabase.co";
+    const SUPABASE_KEY = "sb_publishable_WBpyhdYmnDFaphP4AM5QJA_KwGUXv3_";
+    const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    let currentEmployee = null;
+    let currentJob = null;
+    let pendingStartData = null;
+    let pendingOrderData = null;
+    let reportRows = [];
+    let currentPeriodName = "";
+
+    function page(content) {
+      document.getElementById("app").innerHTML = `<main class="p-4 pb-24 max-w-5xl mx-auto">${content}</main>`;
+    }
+
+    function topBar(title, subtitle = "") {
+      return `
+        <header class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <h1 class="text-2xl font-bold">${title}</h1>
+              <p class="text-gray-400">${subtitle}</p>
+            </div>
+            <button onclick="renderLogin()" class="bg-gray-800 px-4 py-3 rounded-2xl text-sm">יציאה</button>
+          </div>
+        </header>`;
+    }
+
+    function fieldSelect(id, label, options) {
+      return `<div><label class="block mb-2">${label}</label><select id="${id}" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"><option value="">בחר</option>${options.map(o => `<option value="${o}">${o}</option>`).join("")}</select></div>`;
+    }
+
+    function fieldNumber(id, label) {
+      return `<div><label class="block mb-2">${label}</label><input id="${id}" type="number" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></div>`;
+    }
+
+    function clearLoginPassword() {
+      const password = document.getElementById("password");
+      const error = document.getElementById("loginError");
+      if (password) password.value = "";
+      if (error) error.innerText = "";
+    }
+
+    function renderLogin() {
+      document.getElementById("app").innerHTML = `
+        <main class="min-h-screen flex items-center justify-center p-4">
+          <section class="w-full max-w-md bg-gray-900 border border-gray-800 rounded-3xl p-6 shadow-2xl">
+            <h1 class="text-3xl font-bold mb-2">DIGIPACK SMART FLOOR</h1>
+            <p class="text-gray-400 mb-6">למינציה 1 — כניסה</p>
+
+            <label class="block mb-2">עובד</label>
+            <select id="employee" onchange="clearLoginPassword()" autocomplete="off" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-4"><option value="">בחר עובד</option></select>
+
+            <label class="block mb-2">סיסמה</label>
+            <input id="password" type="password" autocomplete="new-password" value="" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-6" placeholder="הכנס סיסמה">
+
+            <button onclick="login()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold text-lg">כניסה</button>
+            <p id="loginError" class="text-red-400 mt-4"></p>
+          </section>
+        </main>`;
+      setTimeout(clearLoginPassword, 50);
+      loadEmployees();
+    }
+
+    async function loadEmployees() {
+      const { data, error } = await client.from("employees").select("*").eq("active", true).order("name");
+      const select = document.getElementById("employee");
+      if (error) { document.getElementById("loginError").innerText = "שגיאה בטעינת עובדים: " + error.message; return; }
+      data.forEach(emp => {
+        const option = document.createElement("option");
+        option.value = emp.id;
+        option.textContent = emp.name;
+        option.dataset.password = emp.password;
+        option.dataset.role = emp.role;
+        select.appendChild(option);
+      });
+    }
+
+    function login() {
+      const select = document.getElementById("employee");
+      const selected = select.options[select.selectedIndex];
+      const password = document.getElementById("password").value;
+      if (!selected.value) return document.getElementById("loginError").innerText = "בחר עובד";
+      if (password !== selected.dataset.password) { document.getElementById("password").value = ""; return document.getElementById("loginError").innerText = "סיסמה שגויה"; }
+
+      currentEmployee = { id: selected.value, name: selected.textContent, role: selected.dataset.role };
+      if (currentEmployee.role === "manager") renderManager();
+      else renderStartForm();
+    }
+
+
+    function parseQRPayload(raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        return {
+          order: parsed.order || parsed.order_number || parsed.pka || parsed["מספר הזמנה"] || "",
+          line: parsed.line || parsed.order_line || parsed["שורה"] || "",
+          customer: parsed.customer || parsed.customer_name || parsed["שם לקוח"] || "",
+          sku: parsed.sku || parsed.item || parsed["מק״ט"] || parsed["מקט"] || "",
+          qty: parsed.qty || parsed.quantity || parsed["כמות"] || "",
+          dueDate: parsed.dueDate || parsed.delivery_date || parsed["תאריך אספקה"] || "",
+          raw
+        };
+      } catch (e) {
+        return { order: raw, line: "", customer: "", sku: "", qty: "", dueDate: "", raw };
+      }
+    }
+
+    function renderOrderInfoCard() {
+      if (!pendingOrderData) return "";
+      return `
+        <div class="bg-blue-900/30 border border-blue-700 rounded-2xl p-4 text-sm space-y-1">
+          <div class="font-bold text-blue-200">נתוני QR שנסרקו</div>
+          <div>הזמנה / פק״ע: ${escapeHtml(pendingOrderData.order || "")}</div>
+          <div>שורה: ${escapeHtml(pendingOrderData.line || "")}</div>
+          <div>לקוח: ${escapeHtml(pendingOrderData.customer || "")}</div>
+          <div>מק״ט: ${escapeHtml(pendingOrderData.sku || "")}</div>
+          <div>כמות: ${escapeHtml(pendingOrderData.qty || "")}</div>
+        </div>`;
+    }
+
+    function renderQRScanner() {
+      page(`
+        ${topBar("סריקת QR הזמנה", `עובד: ${currentEmployee.name}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <p class="text-gray-300">כוון את המצלמה לברקוד/QR שעל פקודת העבודה.</p>
+          <video id="qrVideo" class="w-full rounded-3xl bg-black border border-gray-700" autoplay playsinline></video>
+          <canvas id="qrCanvas" class="hidden"></canvas>
+          <p id="qrMsg" class="text-yellow-300">מפעיל מצלמה...</p>
+          <button onclick="stopQRScanner(); renderStartForm()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור</button>
+        </section>`);
+      startQRScanner();
+    }
+
+    let qrStream = null;
+    let qrScanTimer = null;
+
+    async function startQRScanner() {
+      const msg = document.getElementById("qrMsg");
+      const video = document.getElementById("qrVideo");
+
+      if (!("BarcodeDetector" in window)) {
+        msg.innerText = "הדפדפן לא תומך בסריקת QR מובנית. אפשר להקליד פק״ע ידנית.";
+        return;
+      }
+
+      try {
+        qrStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = qrStream;
+        const detector = new BarcodeDetector({ formats: ["qr_code"] });
+
+        qrScanTimer = setInterval(async () => {
+          try {
+            const codes = await detector.detect(video);
+            if (codes && codes.length) {
+              const raw = codes[0].rawValue;
+              pendingOrderData = parseQRPayload(raw);
+              stopQRScanner();
+              renderStartForm();
+              setTimeout(() => {
+                const pka = document.getElementById("pkaNumber");
+                if (pka && pendingOrderData.order) pka.value = pendingOrderData.order;
+              }, 50);
+            }
+          } catch (e) {}
+        }, 500);
+
+        msg.innerText = "מוכן לסריקה";
+      } catch (e) {
+        msg.innerText = "לא ניתן לפתוח מצלמה: " + e.message;
+      }
+    }
+
+    function stopQRScanner() {
+      if (qrScanTimer) clearInterval(qrScanTimer);
+      qrScanTimer = null;
+      if (qrStream) qrStream.getTracks().forEach(t => t.stop());
+      qrStream = null;
+    }
+
+    function normalizeHeader(value) {
+      return String(value || "")
+        .replaceAll('"', "")
+        .replaceAll("'", "")
+        .replace(/\s+/g, "")
+        .toLowerCase();
+    }
+
+    function findValue(row, candidates) {
+      const keys = Object.keys(row || {});
+      for (const candidate of candidates) {
+        const normCandidate = normalizeHeader(candidate);
+        const key = keys.find(k => normalizeHeader(k).includes(normCandidate) || normCandidate.includes(normalizeHeader(k)));
+        if (key) return row[key] ?? "";
+      }
+      return "";
+    }
+
+    function buildQRPayloadFromRow(row) {
+      return {
+        order: String(findValue(row, ["מספר הזמנה", "הזמנה", "פקע", "פק״ע", "order"]) || ""),
+        line: String(findValue(row, ["שורה", "line"]) || ""),
+        sku: String(findValue(row, ["מקט", "מק״ט", "פריט", "item", "sku"]) || ""),
+        customer: String(findValue(row, ["שם לקוח", "לקוח", "customer"]) || ""),
+        qty: String(findValue(row, ["כמות", "qty", "quantity"]) || ""),
+        dueDate: String(findValue(row, ["תאריך אספקה", "אספקה", "due", "date"]) || "")
+      };
+    }
+
+    let qrOrderRows = [];
+
+    async function loadOrdersExcelForQR() {
+      const file = document.getElementById("ordersExcelFile").files[0];
+      const msg = document.getElementById("qrGeneratorMsg");
+      const container = document.getElementById("qrLabelsContainer");
+      if (!file) { msg.innerText = "בחר קובץ Excel"; return; }
+
+      msg.innerText = "קורא קובץ...";
+      container.innerHTML = "";
+
+      try {
+        const buffer = await file.arrayBuffer();
+        const wb = XLSX.read(buffer, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+        qrOrderRows = rows.map(buildQRPayloadFromRow).filter(r => r.order || r.sku || r.customer);
+
+        if (!qrOrderRows.length) {
+          msg.innerText = "לא נמצאו שורות מתאימות בקובץ";
+          return;
+        }
+
+        msg.innerText = `נמצאו ${qrOrderRows.length} שורות. יוצר QR...`;
+        drawQRLabels(qrOrderRows);
+        msg.innerText = `נוצרו ${qrOrderRows.length} מדבקות QR`;
+      } catch (e) {
+        msg.innerText = "שגיאה בקריאת Excel: " + e.message;
+      }
+    }
+
+    function drawQRLabels(rows) {
+      const container = document.getElementById("qrLabelsContainer");
+      container.innerHTML = rows.map((r, i) => `
+        <div class="qr-label bg-white text-black rounded-2xl p-4 border border-gray-300 break-inside-avoid">
+          <div id="qr_${i}" class="flex justify-center mb-3"></div>
+          <div class="text-sm font-bold">הזמנה: ${escapeHtml(r.order)}</div>
+          <div class="text-xs">שורה: ${escapeHtml(r.line)}</div>
+          <div class="text-xs">לקוח: ${escapeHtml(r.customer)}</div>
+          <div class="text-xs">מק״ט: ${escapeHtml(r.sku)}</div>
+          <div class="text-xs">כמות: ${escapeHtml(r.qty)}</div>
+        </div>
+      `).join("");
+
+      rows.forEach((r, i) => {
+        const el = document.getElementById(`qr_${i}`);
+        if (el) {
+          new QRCode(el, {
+            text: JSON.stringify(r),
+            width: 120,
+            height: 120,
+            correctLevel: QRCode.CorrectLevel.M
+          });
+        }
+      });
+    }
+
+    function printQRLabels() {
+      window.print();
+    }
+
+    function renderStartForm() {
+      page(`
+        ${topBar("פתיחת עבודת למינציה", `עובד: ${currentEmployee.name} | למינציה 1`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <h2 class="text-xl font-bold">פרטי עבודה</h2>
+          ${renderOrderInfoCard()}
+          <button onclick="renderQRScanner()" class="w-full bg-purple-600 p-4 rounded-2xl font-bold text-lg">סרוק QR הזמנה</button>
+
+          <div>
+            <label class="block mb-2">פק״ע</label>
+            <input id="pkaNumber" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="לדוגמה: 0521-26" value="${pendingOrderData?.order || ''}">
+          </div>
+
+          <div>
+            <label class="block mb-2">צילום תווית חומר גלם</label>
+            <input id="labelPhoto" type="file" accept="image/*" capture="environment" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700">
+          </div>
+
+          <button onclick="goToStartQuality()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold text-lg">המשך לטופס איכות לפני התחלה</button>
+          <p id="startMsg" class="mt-4 text-yellow-300"></p>
+        </section>`);
+    }
+
+    function goToStartQuality() {
+      const pkaNumber = document.getElementById("pkaNumber").value.trim();
+      const file = document.getElementById("labelPhoto").files[0];
+      if (!pkaNumber) return document.getElementById("startMsg").innerText = "חובה להזין פק״ע";
+      if (!file) return document.getElementById("startMsg").innerText = "חובה לצלם תווית חומר גלם";
+      pendingStartData = { pkaNumber, file };
+      renderStartQuality();
+    }
+
+    function renderStartQuality() {
+      page(`
+        ${topBar("טופס איכות לפני תחילת עבודה", `פק״ע: ${pendingStartData.pkaNumber}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          ${fieldSelect("laminate_direction", "כיוון למינט", ["קריא", "לא קריא"])}
+          ${fieldSelect("raw_material_match", "התאמת חו״ג לפק״ע", ["כן", "לא"])}
+          ${fieldNumber("thickness", "עובי")}
+          ${fieldNumber("width", "רוחב")}
+          ${fieldNumber("pitch", "פסיעה")}
+          ${fieldSelect("print_cleanliness", "ניקיון הדפסה", ["תקין", "לא תקין"])}
+          ${fieldSelect("material_color", "חומר", ["שקוף", "לבן"])}
+          ${fieldSelect("finish_type", "גימור", ["מט", "מבריק"])}
+          ${fieldSelect("lamination_strength", "חוזק למינציה", ["תקין", "לא תקין"])}
+          ${fieldSelect("sealing_strength", "חוזק הלחמה", ["תקין", "לא תקין"])}
+          ${fieldNumber("work_speed", "מהירות עבודה — מטר/דקה")}
+          ${fieldNumber("drum_temperature", "טמפ׳ תוף")}
+          ${fieldNumber("inlet_drum_temperature", "טמפ׳ תוף כניסה")}
+
+          <label class="block">הערות</label>
+          <textarea id="comments" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></textarea>
+
+          <button onclick="startJobWithQuality()" class="w-full bg-green-600 p-5 rounded-3xl text-xl font-bold">אשר איכות והתחל עבודה</button>
+          <button onclick="renderStartForm()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור</button>
+          <p id="qualityMsg" class="mt-4 text-yellow-300"></p>
+        </section>`);
+    }
+
+    function getQualityPayload(jobId) {
+      const ids = ["laminate_direction","raw_material_match","thickness","width","pitch","print_cleanliness","material_color","finish_type","lamination_strength","sealing_strength","work_speed","drum_temperature","inlet_drum_temperature"];
+      for (const id of ids) if (!document.getElementById(id).value) throw new Error("יש למלא את כל שדות האיכות");
+      return {
+        job_id: jobId,
+        laminate_direction: document.getElementById("laminate_direction").value,
+        raw_material_match: document.getElementById("raw_material_match").value === "כן",
+        thickness: Number(document.getElementById("thickness").value),
+        width: Number(document.getElementById("width").value),
+        pitch: Number(document.getElementById("pitch").value),
+        print_cleanliness: document.getElementById("print_cleanliness").value,
+        material_color: document.getElementById("material_color").value,
+        finish_type: document.getElementById("finish_type").value,
+        lamination_strength: document.getElementById("lamination_strength").value,
+        sealing_strength: document.getElementById("sealing_strength").value,
+        work_speed: Number(document.getElementById("work_speed").value),
+        drum_temperature: Number(document.getElementById("drum_temperature").value),
+        inlet_drum_temperature: Number(document.getElementById("inlet_drum_temperature").value),
+        comments: document.getElementById("comments").value,
+        approved: true
+      };
+    }
+
+    async function startJobWithQuality() {
+      const msg = document.getElementById("qualityMsg");
+      let qualityPayload;
+      try { qualityPayload = getQualityPayload(null); } catch(e) { msg.innerText = e.message; return; }
+
+      const { data: job, error } = await client.from("jobs").insert({
+        order_number: pendingStartData.pkaNumber,
+        employee_id: currentEmployee.id,
+        batch_number: pendingStartData.pkaNumber,
+        start_time: new Date().toISOString(),
+        status: "open"
+      }).select().single();
+
+      if (error) { msg.innerText = "שגיאה ביצירת עבודה: " + error.message; return; }
+
+      currentJob = job;
+      await saveLabel(pendingStartData.file, job.id, pendingStartData.pkaNumber, "start");
+
+      qualityPayload.job_id = job.id;
+      const { error: qError } = await client.from("lamination_quality").insert(qualityPayload);
+      if (qError) { msg.innerText = "שגיאה בשמירת איכות: " + qError.message; return; }
+
+      renderActiveJob();
+    }
+
+    function buildPublicLabelUrl(fileName) {
+      const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
+      return `${SUPABASE_URL}/storage/v1/object/public/labels/${encodedPath}`;
+    }
+
+    async function saveLabel(file, jobId, pkaNumber, labelType) {
+      const originalName = file.name || "label.jpg";
+      const ext = originalName.includes(".") ? originalName.split(".").pop() : "jpg";
+      const fileName = `${jobId}/${Date.now()}-${labelType}.${ext}`;
+      const publicUrl = buildPublicLabelUrl(fileName);
+
+      const { error: uploadError } = await client.storage
+        .from("labels")
+        .upload(fileName, file, {
+          cacheControl: "3600",
+          upsert: true,
+          contentType: file.type || "image/jpeg"
+        });
+
+      if (uploadError) {
+        console.error("שגיאה בהעלאת תווית:", uploadError);
+        alert("שגיאה בהעלאת תווית ל-Storage: " + uploadError.message);
+        return "";
+      }
+
+      const { error: insertError } = await client
+        .from("material_labels")
+        .insert({
+          job_id: jobId,
+          batch_number: pkaNumber,
+          label_type: labelType,
+          image_url: publicUrl
+        });
+
+      if (insertError) {
+        console.error("שגיאה בשמירת קישור תווית:", insertError);
+        alert("התמונה עלתה, אבל שמירת קישור התווית נכשלה: " + insertError.message);
+        return publicUrl;
+      }
+
+      return publicUrl;
+    }
+
+    function renderActiveJob() {
+      page(`
+        ${topBar("עבודה פעילה", `פק״ע: ${currentJob.batch_number}`)}
+        <section class="grid gap-4">
+          <div class="bg-green-900/40 border border-green-700 rounded-3xl p-5">
+            <h2 class="text-xl font-bold">למינציה 1 פעילה</h2>
+            <p class="text-gray-300 mt-2">שעת התחלה: ${new Date(currentJob.start_time).toLocaleTimeString("he-IL")}</p>
+          </div>
+
+          <div class="bg-gray-900 border border-gray-800 rounded-3xl p-5">
+            <h2 class="text-xl font-bold mb-4">טעינת גליל נוסף</h2>
+            <input id="extraLabelPhoto" type="file" accept="image/*" capture="environment" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-4">
+            <button onclick="addExtraRoll()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">צלם ושמור גליל נוסף</button>
+            <p id="activeMsg" class="mt-4 text-yellow-300"></p>
+          </div>
+
+          <button onclick="renderFinishJob()" class="w-full bg-orange-500 p-5 rounded-3xl text-xl font-bold">סיום עבודה</button>
+        </section>`);
+    }
+
+    async function addExtraRoll() {
+      const file = document.getElementById("extraLabelPhoto").files[0];
+      if (!file) return document.getElementById("activeMsg").innerText = "בחר/צלם תווית";
+      await saveLabel(file, currentJob.id, currentJob.batch_number, "extra_roll");
+      document.getElementById("activeMsg").innerText = "גליל נוסף נשמר";
+    }
+
+
+    function buildRollLabelPayload(rollNumber, quantity) {
+      const pka = currentJob?.batch_number || currentJob?.order_number || pendingOrderData?.order || "";
+      const line = pendingOrderData?.line || "";
+      const customer = pendingOrderData?.customer || "";
+      const sku = pendingOrderData?.sku || "";
+      const operatorName = currentEmployee?.name || "";
+      const dateTime = new Date().toLocaleString("he-IL");
+      const rollId = `${pka}${line ? "." + line : ""}.${rollNumber}`;
+
+      return {
+        rollId,
+        pka,
+        line,
+        customer,
+        sku,
+        quantity,
+        rollNumber,
+        operatorName,
+        dateTime
+      };
+    }
+
+    function addRollInputRow() {
+      const container = document.getElementById("rollRows");
+      if (!container) return;
+      const index = container.children.length + 1;
+      const row = document.createElement("div");
+      row.className = "grid grid-cols-2 gap-3 bg-gray-800/50 rounded-2xl p-3";
+      row.innerHTML = `
+        <div>
+          <label class="block mb-2 text-sm text-gray-300">מספר גליל</label>
+          <input class="rollNumber w-full p-3 rounded-xl bg-gray-900 border border-gray-700" type="number" value="${index}">
+        </div>
+        <div>
+          <label class="block mb-2 text-sm text-gray-300">כמות בגליל</label>
+          <input class="rollQty w-full p-3 rounded-xl bg-gray-900 border border-gray-700" type="number" placeholder="מטרים / יחידות">
+        </div>`;
+      container.appendChild(row);
+    }
+
+    function collectRollsFromFinishForm() {
+      const rows = Array.from(document.querySelectorAll("#rollRows > div"));
+      return rows.map(row => {
+        const rollNumber = row.querySelector(".rollNumber")?.value || "";
+        const quantity = row.querySelector(".rollQty")?.value || "";
+        return { rollNumber, quantity };
+      }).filter(r => r.rollNumber && r.quantity);
+    }
+
+    function openRollLabelsPrint() {
+      const rolls = collectRollsFromFinishForm();
+      const msg = document.getElementById("finishMsg");
+      if (!rolls.length) {
+        if (msg) msg.innerText = "יש להזין לפחות גליל אחד עם כמות";
+        return;
+      }
+
+      const labels = rolls.map(r => buildRollLabelPayload(r.rollNumber, r.quantity));
+      const printWindow = window.open("", "_blank", "width=900,height=700");
+      if (!printWindow) {
+        if (msg) msg.innerText = "הדפדפן חסם חלון הדפסה. אפשר חלונות קופצים לאתר.";
+        return;
+      }
+
+      const labelsHtml = labels.map((label, i) => `
+        <section class="label">
+          <div class="grid">
+            <div class="qr" id="qr_${i}"></div>
+            <div class="data">
+              <div class="row"><span>שם לקוח</span><strong>${escapeHtml(label.customer)}</strong></div>
+              <div class="row"><span>פק״ע מספר</span><strong>${escapeHtml(label.pka)}</strong></div>
+              <div class="row"><span>שורת פק״ע</span><strong>${escapeHtml(label.line)}</strong></div>
+              <div class="row"><span>גליל מספר</span><strong>${escapeHtml(label.rollNumber)}</strong></div>
+              <div class="row"><span>כמות</span><strong>${escapeHtml(label.quantity)}</strong></div>
+              <div class="row"><span>שם מפעיל</span><strong>${escapeHtml(label.operatorName)}</strong></div>
+              <div class="row"><span>תאריך</span><strong>${escapeHtml(label.dateTime)}</strong></div>
+            </div>
+          </div>
+          <div class="footer">DIGIPACK SMART FLOOR | ${escapeHtml(label.rollId)}</div>
+        </section>
+      `).join("");
+
+      printWindow.document.open();
+      printWindow.document.write(`
+        <!DOCTYPE html>
+        <html lang="he" dir="rtl">
+        <head>
+          <meta charset="UTF-8">
+          <title>תוויות גליל</title>
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>
+          <style>
+            @page { size: A6 landscape; margin: 6mm; }
+            body { font-family: Arial, sans-serif; direction: rtl; margin: 0; color: #111; }
+            .label { width: 100%; height: 92mm; box-sizing: border-box; border: 2px solid #111; padding: 8mm; page-break-after: always; }
+            .grid { display: grid; grid-template-columns: 42mm 1fr; gap: 8mm; align-items: start; }
+            .qr { width: 38mm; height: 38mm; display: flex; align-items: center; justify-content: center; border: 1px solid #999; padding: 2mm; }
+            .data { border: 1px solid #111; }
+            .row { display: grid; grid-template-columns: 32mm 1fr; border-bottom: 1px solid #111; min-height: 9mm; align-items: center; }
+            .row:last-child { border-bottom: none; }
+            .row span { background: #ddd; height: 100%; display: flex; align-items: center; justify-content: flex-start; padding: 0 3mm; font-weight: bold; border-left: 1px solid #111; }
+            .row strong { padding: 0 3mm; font-size: 16px; }
+            .footer { margin-top: 5mm; font-size: 12px; text-align: center; font-weight: bold; }
+            @media print { .label { page-break-after: always; } }
+          </style>
+        </head>
+        <body>
+          ${labelsHtml}
+          <script>
+            const labels = ${JSON.stringify(labels)};
+            labels.forEach((label, i) => {
+              new QRCode(document.getElementById("qr_" + i), {
+                text: JSON.stringify(label),
+                width: 135,
+                height: 135,
+                correctLevel: QRCode.CorrectLevel.M
+              });
+            });
+            setTimeout(() => window.print(), 500);
+          <\/script>
+        </body>
+        </html>
+      `);
+      printWindow.document.close();
+    }
+
+    function renderFinishJob() {
+      page(`
+        ${topBar("סיום עבודה", `פק״ע: ${currentJob.batch_number}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <div>
+            <label class="block mb-2">כמות מטרים למעבר לתחנה הבאה</label>
+            <input id="transferMeters" type="number" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="הזן מטרים">
+          </div>
+
+          <div class="bg-gray-800/40 border border-gray-700 rounded-3xl p-4">
+            <h2 class="text-xl font-bold mb-3">תוויות גליל A6</h2>
+            <p class="text-gray-400 text-sm mb-3">אפשר להדפיס כמה תוויות לאותה עבודה. כל גליל מקבל מספר וכמות משלו.</p>
+            <div id="rollRows" class="space-y-3"></div>
+            <div class="grid md:grid-cols-2 gap-3 mt-4">
+              <button onclick="addRollInputRow()" class="w-full bg-purple-600 p-4 rounded-2xl font-bold">הוסף גליל</button>
+              <button onclick="openRollLabelsPrint()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">הדפס תוויות גליל</button>
+            </div>
+          </div>
+
+          <button onclick="finishJob()" class="w-full bg-green-600 p-5 rounded-3xl text-xl font-bold">סיים ושמור עבודה</button>
+          <button onclick="renderActiveJob()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור לעבודה פעילה</button>
+          <p id="finishMsg" class="mt-4 text-yellow-300"></p>
+        </section>`);
+      setTimeout(addRollInputRow, 50);
+    }
+
+    async function finishJob() {
+      const meters = document.getElementById("transferMeters").value;
+      if (!meters) return document.getElementById("finishMsg").innerText = "חובה להזין כמות מטרים";
+      const { error } = await client.from("jobs").update({
+        end_time: new Date().toISOString(),
+        status: "closed",
+        transfer_meters: Number(meters)
+      }).eq("id", currentJob.id);
+      if (error) return document.getElementById("finishMsg").innerText = "שגיאה בסגירת עבודה: " + error.message;
+
+      document.getElementById("app").innerHTML = `
+        <main class="min-h-screen flex items-center justify-center p-4">
+          <section class="bg-gray-900 border border-gray-800 rounded-3xl p-8 text-center max-w-md">
+            <h1 class="text-3xl font-bold text-green-400 mb-4">העבודה נסגרה בהצלחה</h1>
+            <p class="text-gray-300 mb-6">הנתונים נשמרו במערכת</p>
+            <button onclick="renderStartForm()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">פתח עבודה חדשה</button>
+          </section>
+        </main>`;
+    }
+
+    function getDateRange(period) {
+      const start = new Date();
+      const end = new Date();
+
+      if (period === "today") {
+        currentPeriodName = "היום";
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "yesterday") {
+        currentPeriodName = "אתמול";
+        start.setDate(start.getDate() - 1);
+        end.setDate(end.getDate() - 1);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "week") {
+        currentPeriodName = "שבוע נוכחי";
+        const day = start.getDay(); // Sunday = 0
+        start.setDate(start.getDate() - day);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "month") {
+        currentPeriodName = "חודש נוכחי";
+        start.setDate(1);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "year") {
+        currentPeriodName = "שנה נוכחית";
+        start.setMonth(0,1);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      return { start: start.toISOString(), end: end.toISOString() };
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+
+    async function refreshEmployeesAdmin() {
+      const tbody = document.getElementById("employeesTableBody");
+      const msg = document.getElementById("employeesMsg");
+      if (!tbody) return;
+
+      tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">טוען עובדים...</td></tr>`;
+
+      const { data, error } = await client
+        .from("employees")
+        .select("*")
+        .order("name");
+
+      if (error) {
+        tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-red-400">${escapeHtml(error.message)}</td></tr>`;
+        if (msg) msg.innerText = "שגיאה בטעינת עובדים";
+        return;
+      }
+
+      if (!data || !data.length) {
+        tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">אין עובדים במערכת</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = data.map(emp => `
+        <tr>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(emp.name)}</td>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">${emp.role === "manager" ? "מנהל" : "עובד"}</td>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">${emp.active ? "פעיל" : "לא פעיל"}</td>
+          <td class="border border-gray-700 p-2">
+            <input id="pwd_${emp.id}" type="text" placeholder="סיסמה חדשה" class="w-full min-w-40 p-2 rounded-xl bg-gray-800 border border-gray-700">
+          </td>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">
+            <button onclick="updateEmployeePassword('${emp.id}')" class="bg-blue-600 px-3 py-2 rounded-xl text-sm font-bold">עדכן סיסמה</button>
+            <button onclick="toggleEmployeeActive('${emp.id}', ${emp.active ? "false" : "true"})" class="bg-orange-600 px-3 py-2 rounded-xl text-sm font-bold">${emp.active ? "השבת" : "הפעל"}</button>
+            <button onclick="setEmployeeRole('${emp.id}', '${emp.role === "manager" ? "operator" : "manager"}')" class="bg-purple-600 px-3 py-2 rounded-xl text-sm font-bold">${emp.role === "manager" ? "הפוך לעובד" : "הפוך למנהל"}</button>
+          </td>
+        </tr>
+      `).join("");
+
+      if (msg) msg.innerText = "";
+    }
+
+    async function createEmployeeAdmin() {
+      const msg = document.getElementById("employeesMsg");
+      const name = document.getElementById("newEmployeeName").value.trim();
+      const password = document.getElementById("newEmployeePassword").value.trim();
+      const role = document.getElementById("newEmployeeRole").value;
+
+      if (!name) { msg.innerText = "חובה להזין שם עובד"; return; }
+      if (!password) { msg.innerText = "חובה להזין סיסמה"; return; }
+
+      const { error } = await client.from("employees").insert({
+        name,
+        password,
+        role,
+        active: true
+      });
+
+      if (error) { msg.innerText = "שגיאה ביצירת עובד: " + error.message; return; }
+
+      document.getElementById("newEmployeeName").value = "";
+      document.getElementById("newEmployeePassword").value = "";
+      document.getElementById("newEmployeeRole").value = "operator";
+      msg.innerText = "העובד נוצר בהצלחה";
+      await refreshEmployeesAdmin();
+    }
+
+    async function updateEmployeePassword(employeeId) {
+      const msg = document.getElementById("employeesMsg");
+      const input = document.getElementById("pwd_" + employeeId);
+      const password = input.value.trim();
+
+      if (!password) { msg.innerText = "הזן סיסמה חדשה"; return; }
+
+      const { error } = await client
+        .from("employees")
+        .update({ password })
+        .eq("id", employeeId);
+
+      if (error) { msg.innerText = "שגיאה בעדכון סיסמה: " + error.message; return; }
+
+      input.value = "";
+      msg.innerText = "הסיסמה עודכנה";
+      await refreshEmployeesAdmin();
+    }
+
+    async function toggleEmployeeActive(employeeId, active) {
+      const msg = document.getElementById("employeesMsg");
+
+      const { error } = await client
+        .from("employees")
+        .update({ active })
+        .eq("id", employeeId);
+
+      if (error) { msg.innerText = "שגיאה בעדכון סטטוס עובד: " + error.message; return; }
+
+      msg.innerText = active ? "העובד הופעל" : "העובד הושבת";
+      await refreshEmployeesAdmin();
+    }
+
+    async function setEmployeeRole(employeeId, role) {
+      const msg = document.getElementById("employeesMsg");
+
+      const { error } = await client
+        .from("employees")
+        .update({ role })
+        .eq("id", employeeId);
+
+      if (error) { msg.innerText = "שגיאה בעדכון הרשאה: " + error.message; return; }
+
+      msg.innerText = "ההרשאה עודכנה";
+      await refreshEmployeesAdmin();
+    }
+
+    function renderManager() {
+      page(`
+        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V21`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">בחירת תקופה</h2>
+          <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <button type="button" onclick="window.loadReport('today')" class="bg-blue-600 p-4 rounded-2xl font-bold">היום</button>
+            <button type="button" onclick="window.loadReport('yesterday')" class="bg-gray-700 p-4 rounded-2xl font-bold">אתמול</button>
+            <button type="button" onclick="window.loadReport('week')" class="bg-gray-700 p-4 rounded-2xl font-bold">שבוע</button>
+            <button type="button" onclick="window.loadReport('month')" class="bg-gray-700 p-4 rounded-2xl font-bold">חודש</button>
+            <button type="button" onclick="window.loadReport('year')" class="bg-gray-700 p-4 rounded-2xl font-bold">שנה</button>
+          </div>
+          <button type="button" onclick="window.exportExcel()" class="w-full mt-4 bg-green-600 p-4 rounded-2xl font-bold">פתח / הורד Excel</button>
+          <p class="text-gray-400 text-sm mt-3">הדוח מוצג כאן באפליקציה. כפתור Excel יפתח או יוריד את הקובץ לפי הגדרות המכשיר.</p>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">מסך תפ״י — יצירת QR מדוח הזמנות פריוריטי</h2>
+          <p class="text-gray-400 text-sm mb-4">העלה Excel של הזמנות, והמערכת תייצר QR לכל שורה להדבקה על פקודת עבודה.</p>
+          <input id="ordersExcelFile" type="file" accept=".xlsx,.xls" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-3">
+          <div class="grid md:grid-cols-2 gap-3">
+            <button onclick="loadOrdersExcelForQR()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">צור QR מהקובץ</button>
+            <button onclick="printQRLabels()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">הדפס מדבקות QR</button>
+          </div>
+          <p id="qrGeneratorMsg" class="text-yellow-300 mt-3"></p>
+          <div id="qrLabelsContainer" class="grid grid-cols-2 md:grid-cols-3 gap-4 mt-5"></div>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">ניהול עובדים והרשאות</h2>
+
+          <div class="grid md:grid-cols-4 gap-3 mb-5">
+            <input id="newEmployeeName" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="שם עובד חדש">
+            <input id="newEmployeePassword" type="text" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="סיסמה">
+            <select id="newEmployeeRole" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700">
+              <option value="operator">עובד</option>
+              <option value="manager">מנהל</option>
+            </select>
+            <button onclick="createEmployeeAdmin()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">צור עובד</button>
+          </div>
+
+          <p id="employeesMsg" class="text-yellow-300 mb-4"></p>
+
+          <div class="overflow-auto">
+            <table class="w-full text-sm border-collapse">
+              <thead>
+                <tr>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">שם עובד</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">הרשאה</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">סטטוס</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">סיסמה חדשה</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">פעולות</th>
+                </tr>
+              </thead>
+              <tbody id="employeesTableBody">
+                <tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">טוען עובדים...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 overflow-auto">
+          <h2 class="text-xl font-bold mb-4">דוח ביצוע</h2>
+          <div id="reportSummary" class="text-gray-300 mb-4">בחר תקופה להצגת דוח</div>
+          <div id="reportTable"></div>
+        </section>`);
+      loadReport("today");
+      refreshEmployeesAdmin();
+    }
+
+    async function loadReport(period) {
+      const { start, end } = getDateRange(period);
+      document.getElementById("reportSummary").innerText = "טוען דוח...";
+
+      const { data: jobs, error } = await client
+        .from("jobs")
+        .select("*, employees(name)")
+        .gte("created_at", start)
+        .lte("created_at", end)
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        document.getElementById("reportTable").innerHTML = `<p class="text-red-400">${escapeHtml(error.message)}</p>`;
+        document.getElementById("reportSummary").innerText = "שגיאה בטעינת דוח";
+        return;
+      }
+
+      const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
+      let labelsByJob = {};
+      let qualityByJob = {};
+
+      if (jobIds.length) {
+        const { data: labels, error: labelsError } = await client
+          .from("material_labels")
+          .select("*")
+          .in("job_id", jobIds);
+
+        if (!labelsError && labels) {
+          labels.forEach(label => {
+            if (!labelsByJob[label.job_id]) labelsByJob[label.job_id] = [];
+            labelsByJob[label.job_id].push(label);
+          });
+        }
+
+        const { data: qualityRows, error: qualityError } = await client
+          .from("lamination_quality")
+          .select("*")
+          .in("job_id", jobIds);
+
+        if (!qualityError && qualityRows) {
+          qualityRows.forEach(q => {
+            if (!qualityByJob[q.job_id]) qualityByJob[q.job_id] = q;
+          });
+        }
+      }
+
+      reportRows = (jobs || []).map(job => {
+        const labels = labelsByJob[job.id] || [];
+        const quality = qualityByJob[job.id] || {};
+        const labelLinks = labels
+          .map(l => l.image_url || "")
+          .filter(Boolean);
+        const firstStartLabel = labels.find(l => l.label_type === "start" && l.image_url)?.image_url || labelLinks[0] || "";
+
+        return {
+          "תאריך": job.created_at ? new Date(job.created_at).toLocaleDateString("he-IL") : "",
+          "שעת התחלה": job.start_time ? new Date(job.start_time).toLocaleTimeString("he-IL") : "",
+          "שעת סיום": job.end_time ? new Date(job.end_time).toLocaleTimeString("he-IL") : "",
+          "שם מפעיל": job.employees?.name || "",
+          "תהליך": job.department || "למינציה",
+          "פק״ע": job.batch_number || job.order_number || "",
+          "כמות מטרים להעברה": job.transfer_meters || "",
+          "כיוון למינט": quality.laminate_direction || "",
+          "התאמת חו״ג לפק״ע": quality.raw_material_match === true ? "כן" : (quality.raw_material_match === false ? "לא" : ""),
+          "עובי": quality.thickness ?? "",
+          "רוחב": quality.width ?? "",
+          "פסיעה": quality.pitch ?? "",
+          "ניקיון הדפסה": quality.print_cleanliness || "",
+          "חומר": quality.material_color || "",
+          "גימור": quality.finish_type || "",
+          "חוזק למינציה": quality.lamination_strength || "",
+          "חוזק הלחמה": quality.sealing_strength || "",
+          "מהירות עבודה": quality.work_speed ?? "",
+          "טמפ׳ תוף": quality.drum_temperature ?? "",
+          "טמפ׳ תוף כניסה": quality.inlet_drum_temperature ?? "",
+          "הערות איכות": quality.comments || "",
+          "אושר איכות": quality.approved === true ? "כן" : (quality.approved === false ? "לא" : ""),
+          "תווית חו״ג ראשית": firstStartLabel,
+          "כל תוויות חו״ג": labelLinks.length ? labelLinks.join(" | ") : ""
+        };
+      });
+
+      document.getElementById("reportSummary").innerText = `${currentPeriodName}: נמצאו ${reportRows.length} רשומות`;
+      drawReportTable(reportRows);
+    }
+
+    function drawReportTable(rows) {
+      const cols = ['תאריך', 'שעת התחלה', 'שעת סיום', 'שם מפעיל', 'תהליך', 'פק״ע', 'כמות מטרים להעברה', 'כיוון למינט', 'התאמת חו״ג לפק״ע', 'עובי', 'רוחב', 'פסיעה', 'ניקיון הדפסה', 'חומר', 'גימור', 'חוזק למינציה', 'חוזק הלחמה', 'מהירות עבודה', 'טמפ׳ תוף', 'טמפ׳ תוף כניסה', 'הערות איכות', 'אושר איכות', 'תווית חו״ג ראשית', 'כל תוויות חו״ג'];
+      if (!rows.length) {
+        document.getElementById("reportTable").innerHTML = "אין נתונים לתקופה שנבחרה";
+        return;
+      }
+
+      function renderCell(col, value) {
+        if ((col.includes("תווית") || col.includes("קישור")) && value) {
+          const links = String(value).split(" | ").filter(Boolean);
+          return links.map((url, i) => `
+            <a class="inline-block bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-xl font-bold underline whitespace-nowrap"
+               href="${url}"
+               target="_blank"
+               rel="noopener noreferrer">
+              פתח תווית${links.length > 1 ? " " + (i + 1) : ""}
+            </a>
+          `).join(" ");
+        }
+        return escapeHtml(value || "");
+      }
+
+      document.getElementById("reportTable").innerHTML = `
+        <table class="w-full text-sm border-collapse">
+          <thead><tr>${cols.map(c => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${c}</th>`).join("")}</tr></thead>
+          <tbody>${rows.map(r => `<tr>${cols.map(c => `<td class="border border-gray-700 p-2 align-top whitespace-nowrap">${renderCell(c, r[c])}</td>`).join("")}</tr>`).join("")}</tbody>
+        </table>`;
+    }
+
+    function exportExcel() {
+      if (!reportRows.length) { alert("אין נתונים לייצוא"); return; }
+      const headers = ['תאריך', 'שעת התחלה', 'שעת סיום', 'שם מפעיל', 'תהליך', 'פק״ע', 'כמות מטרים להעברה', 'כיוון למינט', 'התאמת חו״ג לפק״ע', 'עובי', 'רוחב', 'פסיעה', 'ניקיון הדפסה', 'חומר', 'גימור', 'חוזק למינציה', 'חוזק הלחמה', 'מהירות עבודה', 'טמפ׳ תוף', 'טמפ׳ תוף כניסה', 'הערות איכות', 'אושר איכות', 'תווית חו״ג ראשית', 'כל תוויות חו״ג'];
+      const excelRows = reportRows.map(row => {
+        const newRow = { ...row };
+        if (newRow["תווית חו״ג ראשית"]) newRow["תווית חו״ג ראשית"] = "פתח תווית";
+        if (newRow["כל תוויות חו״ג"]) newRow["כל תוויות חו״ג"] = "פתח תוויות";
+        return newRow;
+      });
+
+      const ws = XLSX.utils.json_to_sheet(excelRows, { header: headers });
+
+      reportRows.forEach((row, idx) => {
+        const excelRowIndex = idx + 1;
+        const mainUrl = row["תווית חו״ג ראשית"];
+        const allUrls = row["כל תוויות חו״ג"];
+
+        if (mainUrl) {
+          const cellAddress = XLSX.utils.encode_cell({ r: excelRowIndex, c: headers.indexOf("תווית חו״ג ראשית") });
+          ws[cellAddress] = { t: "s", v: "פתח תווית", l: { Target: mainUrl, Tooltip: mainUrl } };
+        }
+
+        if (allUrls) {
+          const firstUrl = String(allUrls).split(" | ").filter(Boolean)[0];
+          const cellAddress = XLSX.utils.encode_cell({ r: excelRowIndex, c: headers.indexOf("כל תוויות חו״ג") });
+          ws[cellAddress] = { t: "s", v: "פתח תוויות", l: { Target: firstUrl, Tooltip: allUrls } };
+        }
+      });
+
+      ws["!cols"] = headers.map(h => h.includes("תווית") ? { wch: 18 } : { wch: 16 });
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "דוח מנהל");
+      const today = new Date().toISOString().slice(0,10);
+      XLSX.writeFile(wb, `digipack-manager-report-${today}.xlsx`);
+    }
+
+    window.createEmployeeAdmin = createEmployeeAdmin;
+    window.updateEmployeePassword = updateEmployeePassword;
+    window.toggleEmployeeActive = toggleEmployeeActive;
+    window.setEmployeeRole = setEmployeeRole;
+    window.refreshEmployeesAdmin = refreshEmployeesAdmin;
+    window.loadReport = loadReport;
+    window.exportExcel = exportExcel;
+    window.clearLoginPassword = clearLoginPassword;
+    window.renderQRScanner = renderQRScanner;
+    window.loadOrdersExcelForQR = loadOrdersExcelForQR;
+    window.printQRLabels = printQRLabels;
+    window.addRollInputRow = addRollInputRow;
+    window.openRollLabelsPrint = openRollLabelsPrint;
+    window.renderLogin = renderLogin;
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=21");
+    renderLogin();
+  </script>
+</body>
