@@ -1,0 +1,3409 @@
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DIGIPACK SMART FLOOR V34.6</title>
+  <!-- V34.6: work-order display no line suffix, SKU in order rows, manual print quantity per file, fixed PDF display/navigation; V32 lamination kept unchanged -->
+  <link rel="manifest" href="/manifest.json?v=32">
+  <meta name="theme-color" content="#111827">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    .dg-field label { display:block; margin-bottom:0.45rem; color:#cbd5e1; font-size:0.9rem; font-weight:700; }
+    .dg-field input, .dg-field select { width:100%; padding:1rem; border-radius:1rem; background:#1f2937; border:1px solid #374151; color:white; }
+    .dg-field input[type="file"] { padding:0.85rem; }
+    .dg-pdf-note { color:#cbd5e1; font-size:0.85rem; }
+    .dg-calc-field { background:rgba(20,83,45,0.28); border:1px solid #15803d; color:#bbf7d0; border-radius:1rem; padding:1rem; font-weight:800; }
+    @media print {
+      body { background: white !important; color: black !important; }
+      header, button, input, #reportTable, #employeesTableBody, #reportSummary { display: none !important; }
+      #qrLabelsContainer { display: grid !important; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+      .qr-label { page-break-inside: avoid; border: 1px solid #ccc !important; }
+      .no-print { display: none !important; }
+    }
+  </style>
+</head>
+<body class="bg-gray-950 text-white min-h-screen">
+  <div id="app"></div>
+
+  <script>
+    const SUPABASE_URL = "https://elxfkcwyfmgqysfcfhwy.supabase.co";
+    const SUPABASE_KEY = "sb_publishable_WBpyhdYmnDFaphP4AM5QJA_KwGUXv3_";
+    const client = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    const DIGIPACK_LOGO_DATA_URL = "";
+
+    let currentEmployee = null;
+    let currentJob = null;
+    let pendingStartData = null;
+    let pendingOrderData = null;
+    let reportRows = [];
+    let rollLabelsRowsForExport = [];
+    let workerRollLabelsRows = [];
+    let currentPeriodName = "";
+
+    const PRODUCTION_PROCESSES = {
+      1: ["דפוס", "למינציה", "חיתוך", "שקיות"],
+      2: ["דפוס", "למינציה", "חיתוך"],
+      3: ["דפוס", "חיתוך"],
+      4: ["דפוס בלבד"],
+      5: ["דפוס", "חיתוך", "שקיות"],
+      6: ["דפוס", "למינציה", "למינציה", "חיתוך", "שקיות"],
+      7: ["למינציה", "דפוס", "למינציה", "חיתוך", "שקיות"],
+      8: ["למינציה", "דפוס", "למינציה", "חיתוך"],
+      9: ["למינציה", "חיתוך", "שקיות"],
+      10: ["דפוס", "למינציה קבלנות משנה", "חיתוך", "שקיות"],
+      11: ["דפוס", "למינציה קבלנות משנה", "חיתוך"]
+    };
+
+    function normalizeProcessId(value) {
+      const text = String(value ?? "").trim();
+      if (!text) return "";
+      const match = text.match(/\d+/);
+      if (!match) return "";
+      const id = Number(match[0]);
+      return PRODUCTION_PROCESSES[id] ? id : "";
+    }
+
+    function getProcessSteps(processId) {
+      const id = normalizeProcessId(processId);
+      return id ? PRODUCTION_PROCESSES[id] : [];
+    }
+
+    function getProcessText(processId) {
+      const steps = getProcessSteps(processId);
+      return steps.length ? steps.join(" → ") : "";
+    }
+
+    function renderProcessFlow(processId) {
+      const steps = getProcessSteps(processId);
+      if (!steps.length) return "";
+      return `
+        <div class="bg-green-900/25 border border-green-700 rounded-2xl p-4 mt-4">
+          <div class="font-bold text-green-200 mb-2">תהליך ייצור</div>
+          <div class="flex flex-wrap items-center gap-2 text-lg font-bold">
+            ${steps.map((step, i) => `
+              <span class="bg-gray-800 border border-gray-700 px-3 py-2 rounded-xl">${escapeHtml(step)}</span>
+              ${i < steps.length - 1 ? `<span class="text-green-300">←</span>` : ""}
+            `).join("")}
+          </div>
+        </div>`;
+    }
+
+    function findProcessIdInRow(row) {
+      return normalizeProcessId(findValue(row, ["תהליך", "מספר תהליך", "process", "process_id", "process id"]));
+    }
+
+
+
+    function page(content) {
+      document.getElementById("app").innerHTML = `<main class="p-4 pb-24 max-w-5xl mx-auto">${content}</main>`;
+    }
+
+    function topBar(title, subtitle = "") {
+      return `
+        <header class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <h1 class="text-2xl font-bold">${title}</h1>
+              <p class="text-gray-400">${subtitle}</p>
+            </div>
+            <button onclick="renderLogin()" class="bg-gray-800 px-4 py-3 rounded-2xl text-sm">יציאה</button>
+          </div>
+        </header>`;
+    }
+
+    function fieldSelect(id, label, options) {
+      return `<div><label class="block mb-2">${label}</label><select id="${id}" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"><option value="">בחר</option>${options.map(o => `<option value="${o}">${o}</option>`).join("")}</select></div>`;
+    }
+
+    function fieldNumber(id, label) {
+      return `<div><label class="block mb-2">${label}</label><input id="${id}" type="number" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></div>`;
+    }
+
+    function clearLoginPassword() {
+      const password = document.getElementById("password");
+      const error = document.getElementById("loginError");
+      if (password) password.value = "";
+      if (error) error.innerText = "";
+    }
+
+    function renderLogin() {
+      document.getElementById("app").innerHTML = `
+        <main class="min-h-screen flex items-center justify-center p-4">
+          <section class="w-full max-w-md bg-gray-900 border border-gray-800 rounded-3xl p-6 shadow-2xl">
+            <h1 class="text-3xl font-bold mb-2">DIGIPACK SMART FLOOR</h1>
+            <p class="text-gray-400 mb-6">למינציה 1 — כניסה</p>
+
+            <label class="block mb-2">עובד</label>
+            <select id="employee" onchange="clearLoginPassword()" autocomplete="off" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-4"><option value="">בחר עובד</option></select>
+
+            <label class="block mb-2">סיסמה</label>
+            <input id="password" type="password" autocomplete="new-password" value="" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-6" placeholder="הכנס סיסמה">
+
+            <button onclick="login()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold text-lg">כניסה</button>
+            <p id="loginError" class="text-red-400 mt-4"></p>
+          </section>
+        </main>`;
+      setTimeout(clearLoginPassword, 50);
+      loadEmployees();
+    }
+
+    async function loadEmployees() {
+      const { data, error } = await client.from("employees").select("*").eq("active", true).order("name");
+      const select = document.getElementById("employee");
+      if (error) { document.getElementById("loginError").innerText = "שגיאה בטעינת עובדים: " + error.message; return; }
+      data.forEach(emp => {
+        const option = document.createElement("option");
+        option.value = emp.id;
+        option.textContent = emp.name;
+        option.dataset.password = emp.password;
+        option.dataset.role = emp.role;
+        select.appendChild(option);
+      });
+    }
+
+    function login() {
+      const select = document.getElementById("employee");
+      const selected = select.options[select.selectedIndex];
+      const password = document.getElementById("password").value;
+      if (!selected.value) return document.getElementById("loginError").innerText = "בחר עובד";
+      if (password !== selected.dataset.password) { document.getElementById("password").value = ""; return document.getElementById("loginError").innerText = "סיסמה שגויה"; }
+
+      currentEmployee = { id: selected.value, name: selected.textContent, role: selected.dataset.role };
+      if (currentEmployee.role === "manager") renderManager();
+      else renderStartForm();
+    }
+
+
+    function parseQRPayload(raw) {
+      const text = String(raw || "").trim();
+
+      try {
+        const parsed = JSON.parse(text);
+        return {
+          order: parsed.order || parsed.order_number || parsed.pka || parsed["מספר הזמנה"] || "",
+          line: parsed.line || parsed.order_line || parsed["שורה"] || "",
+          customer: parsed.customer || parsed.customer_name || parsed["שם לקוח"] || "",
+          product: parsed.product || parsed.product_name || parsed.description || parsed["תאור מוצר"] || parsed["תיאור מוצר"] || "",
+          qty: parsed.qty || parsed.quantity || parsed["כמות"] || "",
+          dueDate: parsed.dueDate || parsed.delivery_date || parsed["תאריך אספקה"] || "",
+          processId: normalizeProcessId(parsed.process_id || parsed.processId || parsed.process || parsed["תהליך"] || parsed["מספר תהליך"] || ""),
+          qrCode: parsed.qrCode || text,
+          raw: text
+        };
+      } catch (e) {
+        const parts = text.split(".");
+        return {
+          order: text,
+          line: parts.length >= 3 ? parts[2] : (parts[1] || ""),
+          customer: "",
+          product: "",
+          qty: "",
+          dueDate: "",
+          processId: "",
+          qrCode: text,
+          raw: text
+        };
+      }
+    }
+
+
+    function normalizeQrBase(value) {
+      const s = String(value || "").trim();
+      const parts = s.split(".").filter(Boolean);
+      if (parts.length >= 3) return parts.slice(0, 3).join(".");
+      return s;
+    }
+
+    function labelMatchesPendingOrder(row) {
+      if (!pendingOrderData || !row) return false;
+      const base = normalizeQrBase(pendingOrderData.qrCode || pendingOrderData.order || "");
+      const order = String(pendingOrderData.order || "").trim();
+      const rowQr = String(row.qr_code || "").trim();
+      const rowOrder = String(row.order_number || "").trim();
+      if (base && (rowQr === base || rowQr.startsWith(base + ".") || normalizeQrBase(rowQr) === base)) return true;
+      if (order && (rowOrder === order || rowQr.startsWith(order + "."))) return true;
+      return false;
+    }
+
+    function buildLabelFromRollRow(row) {
+      const originalData = row?.label_data || {};
+      return {
+        ...originalData,
+        rollId: originalData.rollId || row?.qr_code || "",
+        qrCode: row?.qr_code || originalData.qrCode || "",
+        pka: row?.order_number || originalData.pka || "",
+        line: row?.order_line || originalData.line || "",
+        customer: row?.customer_name || originalData.customer || "",
+        product: row?.product_name || originalData.product || originalData.productName || "",
+        quantity: row?.quantity || originalData.quantity || "",
+        unit: row?.unit || originalData.unit || "מטרים",
+        rollNumber: row?.roll_number || originalData.rollNumber || "",
+        operatorName: row?.operator_1 || row?.employee_name || originalData.operatorName || "",
+        operator2: row?.operator_2 || originalData.operator2 || "",
+        shiftChangeAt: row?.shift_change_at || originalData.shiftChangeAt || "",
+        department: row?.department || originalData.department || getCurrentDepartmentName(),
+        dateTime: originalData.dateTime || (row?.printed_at ? new Date(row.printed_at).toLocaleString("he-IL") : ""),
+        dateTimeIso: row?.printed_at || originalData.dateTimeIso || new Date().toISOString(),
+        jobRows: originalData.jobRows || [{
+          line: row?.order_line || originalData.line || "",
+          pka: row?.order_number || originalData.pka || "",
+          customer: row?.customer_name || originalData.customer || "",
+          product: row?.product_name || originalData.product || originalData.productName || "",
+          quantity: row?.quantity || originalData.quantity || ""
+        }]
+      };
+    }
+
+    async function loadWorkerRollLabels() {
+      const container = document.getElementById("workerRollLabelsContainer");
+      if (!container || !pendingOrderData) return;
+      container.innerHTML = `<p class="text-gray-400">טוען תוויות שכבר הודפסו...</p>`;
+
+      const { data, error } = await client
+        .from("roll_labels")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(500);
+
+      if (error) {
+        container.innerHTML = `<p class="text-red-400">שגיאה בטעינת תוויות: ${escapeHtml(error.message)}</p>`;
+        return;
+      }
+
+      workerRollLabelsRows = (data || []).filter(labelMatchesPendingOrder);
+      const originals = workerRollLabelsRows.filter(r => !r.is_copy);
+      const rowsToShow = originals.length ? originals : workerRollLabelsRows;
+
+      if (!rowsToShow.length) {
+        container.innerHTML = `<p class="text-gray-400">עדיין לא הודפסו תוויות גליל לעבודה הזו.</p>`;
+        return;
+      }
+
+      container.innerHTML = `
+        <div class="overflow-auto">
+          <table class="w-full text-sm border-collapse">
+            <thead>
+              <tr>
+                ${["גליל", "כמות", "יחידה", "מפעיל 1", "מפעיל 2", "תאריך", "פעולות"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsToShow.map(r => `
+                <tr>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.roll_number || "")}</td>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.quantity || "")}</td>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.unit || "")}</td>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.operator_1 || r.employee_name || "")}</td>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.operator_2 || "")}</td>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap">${r.printed_at ? new Date(r.printed_at).toLocaleString("he-IL") : ""}</td>
+                  <td class="border border-gray-700 p-2 whitespace-nowrap flex gap-2">
+                    <button onclick="printWorkerRollLabelCopy('${r.id}')" class="bg-blue-600 px-3 py-2 rounded-xl font-bold text-xs">הדפס העתק</button>
+                    <button onclick="assignSecondOperatorToRoll('${r.id}')" class="bg-purple-600 px-3 py-2 rounded-xl font-bold text-xs">העבר אליי</button>
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+        <p class="text-xs text-gray-400 mt-3">“העבר אליי” מתאים למקרה של החלפת משמרת כשהגליל ממשיך לרוץ והמפעיל הנכנס מצטרף לאותו גליל.</p>`;
+    }
+
+    function printWorkerRollLabelCopy(id) {
+      const row = workerRollLabelsRows.find(r => r.id === id) || rollLabelsRowsForExport.find(r => r.id === id);
+      if (!row) { alert("לא נמצאה תווית"); return; }
+      openRollLabelsPrint(true, [buildLabelFromRollRow(row)]);
+    }
+
+    async function assignSecondOperatorToRoll(id) {
+      const row = workerRollLabelsRows.find(r => r.id === id);
+      if (!row) { alert("לא נמצא גליל"); return; }
+      const now = new Date().toISOString();
+      const originalData = row.label_data || {};
+      const newData = {
+        ...originalData,
+        operator2: currentEmployee?.name || "",
+        shiftChangeAt: now
+      };
+
+      const { error } = await client
+        .from("roll_labels")
+        .update({
+          operator_1: row.operator_1 || row.employee_name || originalData.operatorName || "",
+          operator_2: currentEmployee?.name || "",
+          shift_change_at: now,
+          label_data: newData
+        })
+        .eq("id", id);
+
+      if (error) {
+        alert("שגיאה בשמירת החלפת משמרת: " + error.message + "\nיש לוודא שה-SQL של V31 הורץ.");
+        return;
+      }
+      alert("החלפת משמרת נשמרה לגליל " + (row.roll_number || ""));
+      await loadWorkerRollLabels();
+    }
+
+    function renderOrderInfoCard() {
+      if (!pendingOrderData) return "";
+      return `
+        <div class="bg-blue-900/30 border border-blue-700 rounded-2xl p-4 text-sm space-y-1">
+          <div class="font-bold text-blue-200">נתוני QR שנסרקו</div>
+          <div>הזמנה / פק״ע: ${escapeHtml(pendingOrderData.order || "")}</div>
+          <div>שורה: ${escapeHtml(pendingOrderData.line || "")}</div>
+          <div>לקוח: ${escapeHtml(pendingOrderData.customer || "")}</div>
+          <div>שם מוצר: ${escapeHtml(pendingOrderData.product || "")}</div>
+          <div>כמות: ${escapeHtml(pendingOrderData.qty || "")}</div>
+          ${renderProcessFlow(pendingOrderData.processId)}
+        </div>
+        <div class="bg-gray-900/60 border border-gray-700 rounded-2xl p-4 mt-4">
+          <div class="flex items-center justify-between gap-3 mb-3">
+            <h3 class="font-bold text-lg">תוויות שכבר הודפסו לעבודה</h3>
+            <button onclick="loadWorkerRollLabels()" class="bg-gray-700 px-3 py-2 rounded-xl text-sm font-bold">רענן</button>
+          </div>
+          <div id="workerRollLabelsContainer"><p class="text-gray-400">טוען תוויות...</p></div>
+        </div>`;
+    }
+
+    function renderQRScanner() {
+      page(`
+        ${topBar("סריקת QR הזמנה", `עובד: ${currentEmployee.name}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <p class="text-gray-300">כוון את המצלמה לברקוד/QR שעל פקודת העבודה.</p>
+          <video id="qrVideo" class="w-full rounded-3xl bg-black border border-gray-700" autoplay playsinline></video>
+          <canvas id="qrCanvas" class="hidden"></canvas>
+          <p id="qrMsg" class="text-yellow-300">מפעיל מצלמה...</p>
+          <button onclick="stopQRScanner(); renderStartForm()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור</button>
+        </section>`);
+      startQRScanner();
+    }
+
+    let qrStream = null;
+    let qrScanTimer = null;
+
+    async function startQRScanner() {
+      const msg = document.getElementById("qrMsg");
+      const video = document.getElementById("qrVideo");
+
+      if (!("BarcodeDetector" in window)) {
+        msg.innerText = "הדפדפן לא תומך בסריקת QR מובנית. אפשר להקליד פק״ע ידנית.";
+        return;
+      }
+
+      try {
+        qrStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+        video.srcObject = qrStream;
+        const detector = new BarcodeDetector({ formats: ["qr_code"] });
+
+        qrScanTimer = setInterval(async () => {
+          try {
+            const codes = await detector.detect(video);
+            if (codes && codes.length) {
+              const raw = codes[0].rawValue;
+              let parsed = parseQRPayload(raw);
+              const found = await findOrderLineByQR(parsed.qrCode || raw);
+              pendingOrderData = found || parsed;
+              stopQRScanner();
+              renderStartForm();
+              setTimeout(() => {
+                const pka = document.getElementById("pkaNumber");
+                if (pka && pendingOrderData.order) pka.value = pendingOrderData.order;
+              }, 50);
+            }
+          } catch (e) {}
+        }, 500);
+
+        msg.innerText = "מוכן לסריקה";
+      } catch (e) {
+        msg.innerText = "לא ניתן לפתוח מצלמה: " + e.message;
+      }
+    }
+
+    function stopQRScanner() {
+      if (qrScanTimer) clearInterval(qrScanTimer);
+      qrScanTimer = null;
+      if (qrStream) qrStream.getTracks().forEach(t => t.stop());
+      qrStream = null;
+    }
+
+
+    function getLastDigits(value, count = 4) {
+      const digits = String(value || "").replace(/\D/g, "");
+      return digits.slice(-count).padStart(count, "0");
+    }
+
+    function getYearTwoDigitsFromRow(row) {
+      const raw = findValue(row, ["שנה", "שנת הזמנה", "תאריך הזמנה", "תאריך", "date"]);
+      if (!raw) return String(new Date().getFullYear()).slice(-2);
+
+      if (raw instanceof Date) return String(raw.getFullYear()).slice(-2);
+
+      const text = String(raw);
+      const year4 = text.match(/20\d{2}/);
+      if (year4) return year4[0].slice(-2);
+
+      const year2 = text.match(/\b\d{2}\b/);
+      if (year2) return year2[0];
+
+      return String(new Date().getFullYear()).slice(-2);
+    }
+
+    function formatLineTwoDigits(value) {
+      const digits = String(value || "").replace(/\D/g, "");
+      return (digits || "0").padStart(2, "0");
+    }
+
+    function buildShortQRFromRow(row) {
+      const order = String(findValue(row, ["הזמנה", "מספר הזמנה", "פקע", "פק״ע", "order"]) || "").trim();
+      const line = String(findValue(row, ["שורה", "line"]) || "").trim();
+      const orderPart = getLastDigits(order, 4);
+      const yearPart = getYearTwoDigitsFromRow(row);
+      const linePart = formatLineTwoDigits(line);
+      return `${orderPart}.${yearPart}.${linePart}`;
+    }
+
+    function makeQRDataUrl(text, size = 160) {
+      const qr = new QRious({
+        value: String(text || ""),
+        size,
+        level: "H",
+        background: "white",
+        foreground: "black"
+      });
+      return qr.toDataURL("image/png");
+    }
+
+    function downloadBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function normalizeHeader(value) {
+      return String(value || "")
+        .replaceAll('"', "")
+        .replaceAll("'", "")
+        .replace(/\s+/g, "")
+        .toLowerCase();
+    }
+
+    function findValue(row, candidates) {
+      const keys = Object.keys(row || {});
+      for (const candidate of candidates) {
+        const normCandidate = normalizeHeader(candidate);
+        const key = keys.find(k => normalizeHeader(k).includes(normCandidate) || normCandidate.includes(normalizeHeader(k)));
+        if (key) return row[key] ?? "";
+      }
+      return "";
+    }
+
+    function buildQRPayloadFromRow(row) {
+      const order = String(findValue(row, ["הזמנה", "מספר הזמנה", "פקע", "פק״ע", "order"]) || "").trim();
+      const line = String(findValue(row, ["שורה", "line"]) || "").trim();
+      const product = String(findValue(row, ["תאור מוצר", "תיאור מוצר", "שם מוצר", "מוצר", "description", "product"]) || "").trim();
+
+      return {
+        order,
+        line,
+        qrCode: buildShortQRFromRow(row),
+        product,
+        customer: String(findValue(row, ["שם לקוח", "לקוח", "customer"]) || "").trim(),
+        qty: String(findValue(row, ["כמות", "יתרה לאספקה", "qty", "quantity"]) || "").trim(),
+        dueDate: String(findValue(row, ["תאריך אספקה", "ת. אספקה", "אספקה", "due", "date"]) || "").trim(),
+        processId: findProcessIdInRow(row),
+        processText: getProcessText(findProcessIdInRow(row)),
+        originalRow: row
+      };
+    }
+
+    function buildQRScanPayload(row) {
+      return JSON.stringify({
+        qrCode: row.qrCode || "",
+        order: row.order || "",
+        line: row.line || "",
+        customer: row.customer || "",
+        product: row.product || "",
+        qty: row.qty || "",
+        dueDate: row.dueDate || "",
+        process_id: row.processId || "",
+        process_text: row.processText || ""
+      });
+    }
+
+    function getQRScanText(row) {
+      // V32.3: The QR image itself contains only the short stable code, e.g. 0730.26.02.
+      // Full Hebrew data is saved in Supabase order_lines to avoid dense/unreadable QR and encoding problems.
+      return String((row && row.qrCode) || "");
+    }
+
+    async function trySaveOrderLines(rows, msg) {
+      try {
+        const saveResult = await saveOrderLinesToSupabase(rows);
+        if (!saveResult.ok) {
+          console.error("שמירה ל-order_lines נכשלה", saveResult.error);
+          if (msg) msg.innerText = "אזהרה: לא נשמר ל-order_lines, אבל יש לתקן הרשאות order_lines כי ה-QR מכיל קוד קצר בלבד. שגיאה: " + (saveResult.error?.message || "לא ידועה");
+          return { ok: false, count: 0, error: saveResult.error };
+        }
+        console.log("נשמרו order_lines:", saveResult.count);
+        return saveResult;
+      } catch (e) {
+        console.error("שגיאה בשמירה ל-order_lines", e);
+        if (msg) msg.innerText = "אזהרה: לא נשמר ל-order_lines, אבל יש לתקן הרשאות order_lines כי ה-QR מכיל קוד קצר בלבד. שגיאה: " + e.message;
+        return { ok: false, count: 0, error: e };
+      }
+    }
+
+
+    function getOrderLinePayload(row) {
+      const order = String(findValue(row, ["הזמנה", "מספר הזמנה", "פקע", "פק״ע", "order"]) || "").trim();
+      const line = String(findValue(row, ["שורה", "line"]) || "").trim();
+      const customer = String(findValue(row, ["שם לקוח", "לקוח", "customer"]) || "").trim();
+      const product = String(findValue(row, ["תאור מוצר", "תיאור מוצר", "שם מוצר", "מוצר", "description", "product"]) || "").trim();
+      const qty = String(findValue(row, ["כמות", "יתרה לאספקה", "qty", "quantity"]) || "").trim();
+      const dueDate = String(findValue(row, ["תאריך אספקה", "ת. אספקה", "אספקה", "due", "date"]) || "").trim();
+      const qrCode = buildShortQRFromRow(row);
+
+      const processId = findProcessIdInRow(row);
+      const payload = {
+        qr_code: qrCode,
+        order_number: order,
+        order_line: line,
+        customer_name: customer,
+        product_name: product,
+        quantity: qty,
+        due_date: dueDate,
+        raw_data: { ...row, process_id: processId || "", process_text: getProcessText(processId) }
+      };
+
+      if (processId) {
+        payload.process_id = processId;
+        payload.process_text = getProcessText(processId);
+      }
+
+      return payload;
+    }
+
+    async function saveOrderLinesToSupabase(rows) {
+      const payload = rows.map(getOrderLinePayload).filter(r => r.qr_code && r.order_number);
+      if (!payload.length) return { ok: true, count: 0 };
+
+      const { error } = await client
+        .from("order_lines")
+        .upsert(payload, { onConflict: "qr_code" });
+
+      if (error) return { ok: false, error };
+      return { ok: true, count: payload.length };
+    }
+
+    async function findOrderLineByQR(qrCode) {
+      const { data, error } = await client
+        .from("order_lines")
+        .select("*")
+        .eq("qr_code", qrCode)
+        .maybeSingle();
+
+      if (error) {
+        console.error("שגיאה בחיפוש שורת הזמנה:", error);
+        return null;
+      }
+
+      if (!data) return null;
+
+      return {
+        order: data.order_number || "",
+        line: data.order_line || "",
+        customer: data.customer_name || "",
+        product: data.product_name || "",
+        qty: data.quantity || "",
+        dueDate: data.due_date || "",
+        processId: normalizeProcessId(data.process_id || data.raw_data?.process_id || ""),
+        processText: data.process_text || getProcessText(data.process_id || data.raw_data?.process_id || ""),
+        qrCode: data.qr_code || qrCode,
+        raw: qrCode
+      };
+    }
+
+    async function loadOrdersExcelForQR() {
+      const file = document.getElementById("ordersExcelFile").files[0];
+      const msg = document.getElementById("qrGeneratorMsg");
+      const container = document.getElementById("qrLabelsContainer");
+      if (!file) { msg.innerText = "בחר קובץ Excel"; return; }
+
+      msg.innerText = "קורא קובץ...";
+      container.innerHTML = "";
+
+      try {
+        const buffer = await file.arrayBuffer();
+        const wb = XLSX.read(buffer, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+        qrOrderRows = rows.map(buildQRPayloadFromRow).filter(r => r.order || r.product || r.customer);
+
+        if (!qrOrderRows.length) {
+          msg.innerText = "לא נמצאו שורות מתאימות בקובץ";
+          return;
+        }
+
+        msg.innerText = `נמצאו ${qrOrderRows.length} שורות. שומר לטבלת order_lines ומייצר QR קצר...`;
+        const saveResult = await trySaveOrderLines(rows, msg);
+
+        drawQRLabels(qrOrderRows);
+        msg.innerText = saveResult.ok
+          ? `נוצרו ${qrOrderRows.length} מדבקות QR ונשמרו ${saveResult.count} שורות להזמנות`
+          : `נוצרו ${qrOrderRows.length} מדבקות QR. שים לב: order_lines לא נשמר, אבל יש לתקן הרשאות order_lines כי ה-QR מכיל קוד קצר בלבד.`;
+      } catch (e) {
+        msg.innerText = "שגיאה בקריאת Excel: " + e.message;
+      }
+    }
+
+    function drawQRLabels(rows) {
+      const container = document.getElementById("qrLabelsContainer");
+      container.innerHTML = rows.map((r, i) => `
+        <div class="qr-label bg-white text-black rounded-2xl p-4 border border-gray-300 break-inside-avoid">
+          <div id="qr_${i}" class="flex justify-center mb-3 min-h-[130px]"></div>
+          <div class="text-sm font-bold">QR: ${escapeHtml(r.qrCode)}</div>
+          <div class="text-sm font-bold">הזמנה: ${escapeHtml(r.order)}</div>
+          <div class="text-xs">שורה: ${escapeHtml(r.line)}</div>
+          <div class="text-xs">לקוח: ${escapeHtml(r.customer)}</div>
+          <div class="text-xs">שם מוצר: ${escapeHtml(r.product)}</div>
+          <div class="text-xs">כמות: ${escapeHtml(r.qty)}</div>
+          ${r.processText ? `<div class="text-xs font-bold text-green-700">תהליך: ${escapeHtml(r.processText)}</div>` : ""}
+          <div class="grid grid-cols-2 gap-2 mt-3 no-print">
+            <button onclick="copyQRText('${String(r.qrCode).replaceAll("'", "\'")}')" class="bg-blue-600 text-white rounded-lg p-2 text-xs font-bold">העתק קוד</button>
+            <button onclick="printSingleQR(${i})" class="bg-green-600 text-white rounded-lg p-2 text-xs font-bold">הדפס בודד</button>
+          </div>
+        </div>
+      `).join("");
+
+      rows.forEach((r, i) => {
+        const el = document.getElementById(`qr_${i}`);
+        if (el) {
+          try {
+            new QRCode(el, {
+              text: getQRScanText(r),
+              width: 220,
+              height: 220,
+              correctLevel: QRCode.CorrectLevel.H
+            });
+          } catch (e) {
+            el.innerHTML = `<div class="text-red-700 text-xs">שגיאה ביצירת QR: ${escapeHtml(e.message)}</div>`;
+          }
+        }
+      });
+    }
+
+    async function copyQRText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        alert("קוד QR הועתק: " + text);
+      } catch (e) {
+        alert("לא ניתן להעתיק אוטומטית. הקוד: " + text);
+      }
+    }
+
+    function printSingleQR(index) {
+      const row = qrOrderRows[index];
+      if (!row) return;
+      const win = window.open("", "_blank", "width=600,height=500");
+      win.document.write(`
+        <!DOCTYPE html>
+        <html lang="he" dir="rtl">
+        <head>
+          <meta charset="UTF-8">
+          <title>QR ${escapeHtml(row.qrCode)}</title>
+          <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script>
+          <style>
+            body { font-family: Arial; direction: rtl; padding: 20px; }
+            .card { border: 2px solid #111; padding: 16px; width: 90mm; }
+            #singleQr { margin-bottom: 12px; }
+            .line { margin: 4px 0; font-size: 14px; }
+            .big { font-size: 18px; font-weight: bold; }
+            @media print { button { display:none; } }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <div id="singleQr"></div>
+            <div class="big">QR: ${escapeHtml(row.qrCode)}</div>
+            <div class="line">הזמנה: ${escapeHtml(row.order)}</div>
+            <div class="line">שורה: ${escapeHtml(row.line)}</div>
+            <div class="line">לקוח: ${escapeHtml(row.customer)}</div>
+            <div class="line">שם מוצר: ${escapeHtml(row.product)}</div>
+            <div class="line">כמות: ${escapeHtml(row.qty)}</div>
+            ${row.processText ? `<div class="line"><strong>תהליך ייצור:</strong> ${escapeHtml(row.processText)}</div>` : ""}
+          </div>
+          <button onclick="window.print()">הדפס</button>
+          <script>
+            new QRCode(document.getElementById("singleQr"), {
+              text: ${JSON.stringify(getQRScanText(row))},
+              width: 240,
+              height: 240,
+              correctLevel: QRCode.CorrectLevel.H
+            });
+            setTimeout(() => window.print(), 500);
+          <\/script>
+        </body>
+        </html>
+      `);
+      win.document.close();
+    }
+
+
+    async function downloadExcelWithQR() {
+      const file = document.getElementById("ordersExcelFile")?.files?.[0];
+      const msg = document.getElementById("qrGeneratorMsg");
+
+      if (!file) {
+        if (msg) msg.innerText = "בחר קובץ Excel";
+        return;
+      }
+
+      try {
+        if (msg) msg.innerText = "מכין Excel עם QR...";
+
+        const buffer = await file.arrayBuffer();
+        const wbRaw = XLSX.read(buffer, { type: "array", cellDates: true });
+        const wsRaw = wbRaw.Sheets[wbRaw.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(wsRaw, { defval: "" });
+
+        if (!rows.length) {
+          if (msg) msg.innerText = "לא נמצאו שורות בקובץ";
+          return;
+        }
+
+        if (msg) msg.innerText = "שומר הזמנות ומכין Excel עם QR קצר...";
+        await trySaveOrderLines(rows, msg);
+
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet("הזמנות עם QR", { views: [{ rightToLeft: true }] });
+
+        const originalHeaders = Object.keys(rows[0]);
+        const hasProcessValues = rows.some(row => !!findProcessIdInRow(row));
+        const headers = hasProcessValues ? [...originalHeaders, "תהליך ייצור", "QR קוד", "QR"] : [...originalHeaders, "QR קוד", "QR"];
+        worksheet.addRow(headers);
+
+        const headerRow = worksheet.getRow(1);
+        headerRow.font = { bold: true };
+        headerRow.alignment = { vertical: "middle", horizontal: "center" };
+
+        rows.forEach((row, idx) => {
+          const qrPayloadRow = buildQRPayloadFromRow(row);
+          const qrCode = qrPayloadRow.qrCode;
+          const processId = findProcessIdInRow(row);
+          const processText = getProcessText(processId);
+          const rowValues = hasProcessValues
+            ? [...originalHeaders.map(h => row[h]), processText, qrCode, ""]
+            : [...originalHeaders.map(h => row[h]), qrCode, ""];
+          const excelRow = worksheet.addRow(rowValues);
+          excelRow.height = 125;
+
+          const qrDataUrl = makeQRDataUrl(getQRScanText(qrPayloadRow), 320);
+          const imageId = workbook.addImage({
+            base64: qrDataUrl,
+            extension: "png"
+          });
+
+          const qrColIndex = headers.length;
+          worksheet.addImage(imageId, {
+            tl: { col: qrColIndex - 1 + 0.15, row: idx + 1 + 0.15 },
+            ext: { width: 118, height: 118 }
+          });
+        });
+
+        worksheet.columns = headers.map(h => {
+          if (h === "QR") return { width: 20 };
+          if (h === "QR קוד") return { width: 16 };
+          return { width: 18 };
+        });
+
+        worksheet.getColumn(headers.length).alignment = { vertical: "middle", horizontal: "center" };
+
+        const outBuffer = await workbook.xlsx.writeBuffer();
+        const blob = new Blob([outBuffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        });
+
+        const today = new Date().toISOString().slice(0, 10);
+        downloadBlob(blob, `priority-orders-with-qr-${today}.xlsx`);
+
+        if (msg) msg.innerText = `נוצר Excel עם QR קצר עבור ${rows.length} שורות. ה-QR מכיל קוד קצר; לקוח, מוצר ותהליך נשמרים בטבלת order_lines.`;
+      } catch (e) {
+        console.error(e);
+        if (msg) msg.innerText = "שגיאה ביצירת Excel עם QR: " + e.message;
+      }
+    }
+
+    function printQRLabels() {
+      window.print();
+    }
+
+
+    function renderReprintRollLabelForm() {
+      if (!pendingOrderData) {
+        alert("יש לסרוק QR קודם");
+        return;
+      }
+
+      const rollNumber = prompt("מספר גליל להדפסה חוזרת:", "1");
+      if (!rollNumber) return;
+
+      const quantity = prompt("כמות להדפסה חוזרת:", "");
+      if (!quantity) return;
+
+      const label = {
+        rollId: `${pendingOrderData.qrCode || pendingOrderData.order}.${rollNumber}`,
+        qrCode: `${pendingOrderData.qrCode || pendingOrderData.order}.${rollNumber}`,
+        pka: pendingOrderData.order || "",
+        line: pendingOrderData.line || "",
+        customer: pendingOrderData.customer || "",
+        product: pendingOrderData.product || "",
+        quantity,
+        unit: getMeasurementUnitForDepartment(getCurrentDepartmentName()),
+        rollNumber,
+        operatorName: currentEmployee?.name || "",
+        department: getCurrentDepartmentName(),
+        dateTime: new Date().toLocaleString("he-IL"),
+        dateTimeIso: new Date().toISOString()
+      };
+
+      openRollLabelsPrint(true, [label]);
+    }
+
+
+    async function useManualQR() {
+      const input = document.getElementById("manualQrCode");
+      const msg = document.getElementById("startMsg");
+      const qr = String(input?.value || "").trim();
+      if (!qr) {
+        if (msg) msg.innerText = "הקלד קוד QR";
+        return;
+      }
+      const found = await findOrderLineByQR(qr);
+      pendingOrderData = found || parseQRPayload(qr);
+      renderStartForm();
+      setTimeout(() => {
+        const pka = document.getElementById("pkaNumber");
+        if (pka && pendingOrderData.order) pka.value = pendingOrderData.order;
+      }, 50);
+    }
+
+    function renderStartForm() {
+      page(`
+        ${topBar("פתיחת עבודת למינציה", `עובד: ${currentEmployee.name} | למינציה 1`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <h2 class="text-xl font-bold">פרטי עבודה</h2>
+          <button onclick="renderPrintWorkStart()" class="w-full bg-pink-700 p-4 rounded-2xl font-bold text-lg">מעבר לדפוס — סריקת QR קובץ הדפסה</button>
+          <div class="text-center text-gray-500 text-sm">או המשך ללמינציה</div>
+          ${renderOrderInfoCard()}
+          <button onclick="renderQRScanner()" class="w-full bg-purple-600 p-4 rounded-2xl font-bold text-lg">סרוק QR הזמנה</button>
+          <div class="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-2">
+            <input id="manualQrCode" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 ltr" placeholder="הקלד QR ידנית, לדוגמה 0730.26.02">
+            <button onclick="useManualQR()" class="bg-indigo-600 px-5 py-4 rounded-2xl font-bold">טען QR ידנית</button>
+          </div>
+          ${pendingOrderData ? `<button onclick="renderReprintRollLabelForm()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold text-lg">הדפס תווית מחדש</button>` : ""}
+
+          <div>
+            <label class="block mb-2">פק״ע</label>
+            <input id="pkaNumber" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="לדוגמה: 0521-26" value="${pendingOrderData?.order || ''}">
+          </div>
+
+          <div>
+            <label class="block mb-2">צילום תווית חומר גלם</label>
+            <input id="labelPhoto" type="file" accept="image/*" capture="environment" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700">
+          </div>
+
+          <button onclick="goToStartQuality()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold text-lg">המשך לטופס איכות לפני התחלה</button>
+          <p id="startMsg" class="mt-4 text-yellow-300"></p>
+        </section>`);
+      if (pendingOrderData) setTimeout(loadWorkerRollLabels, 100);
+    }
+
+    function goToStartQuality() {
+      const pkaNumber = document.getElementById("pkaNumber").value.trim();
+      const file = document.getElementById("labelPhoto").files[0];
+      if (!pkaNumber) return document.getElementById("startMsg").innerText = "חובה להזין פק״ע";
+      if (!file) return document.getElementById("startMsg").innerText = "חובה לצלם תווית חומר גלם";
+      pendingStartData = { pkaNumber, file };
+      renderStartQuality();
+    }
+
+    function renderStartQuality() {
+      page(`
+        ${topBar("טופס איכות לפני תחילת עבודה", `פק״ע: ${pendingStartData.pkaNumber}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          ${fieldSelect("laminate_direction", "כיוון למינט", ["קריא", "לא קריא"])}
+          ${fieldSelect("raw_material_match", "התאמת חו״ג לפק״ע", ["כן", "לא"])}
+          ${fieldNumber("thickness", "עובי")}
+          ${fieldNumber("width", "רוחב")}
+          ${fieldNumber("pitch", "פסיעה")}
+          ${fieldSelect("print_cleanliness", "ניקיון הדפסה", ["תקין", "לא תקין"])}
+          ${fieldSelect("material_color", "חומר", ["שקוף", "לבן"])}
+          ${fieldSelect("finish_type", "גימור", ["מט", "מבריק"])}
+          ${fieldSelect("lamination_strength", "חוזק למינציה", ["תקין", "לא תקין"])}
+          ${fieldSelect("sealing_strength", "חוזק הלחמה", ["תקין", "לא תקין"])}
+          ${fieldNumber("work_speed", "מהירות עבודה — מטר/דקה")}
+          ${fieldNumber("drum_temperature", "טמפ׳ תוף")}
+          ${fieldNumber("inlet_drum_temperature", "טמפ׳ תוף כניסה")}
+
+          <label class="block">הערות</label>
+          <textarea id="comments" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></textarea>
+
+          <button onclick="startJobWithQuality()" class="w-full bg-green-600 p-5 rounded-3xl text-xl font-bold">אשר איכות והתחל עבודה</button>
+          <button onclick="renderStartForm()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור</button>
+          <p id="qualityMsg" class="mt-4 text-yellow-300"></p>
+        </section>`);
+    }
+
+    function getQualityPayload(jobId) {
+      const ids = ["laminate_direction","raw_material_match","thickness","width","pitch","print_cleanliness","material_color","finish_type","lamination_strength","sealing_strength","work_speed","drum_temperature","inlet_drum_temperature"];
+      for (const id of ids) if (!document.getElementById(id).value) throw new Error("יש למלא את כל שדות האיכות");
+      return {
+        job_id: jobId,
+        laminate_direction: document.getElementById("laminate_direction").value,
+        raw_material_match: document.getElementById("raw_material_match").value === "כן",
+        thickness: Number(document.getElementById("thickness").value),
+        width: Number(document.getElementById("width").value),
+        pitch: Number(document.getElementById("pitch").value),
+        print_cleanliness: document.getElementById("print_cleanliness").value,
+        material_color: document.getElementById("material_color").value,
+        finish_type: document.getElementById("finish_type").value,
+        lamination_strength: document.getElementById("lamination_strength").value,
+        sealing_strength: document.getElementById("sealing_strength").value,
+        work_speed: Number(document.getElementById("work_speed").value),
+        drum_temperature: Number(document.getElementById("drum_temperature").value),
+        inlet_drum_temperature: Number(document.getElementById("inlet_drum_temperature").value),
+        comments: document.getElementById("comments").value,
+        approved: true
+      };
+    }
+
+    async function startJobWithQuality() {
+      const msg = document.getElementById("qualityMsg");
+      let qualityPayload;
+      try { qualityPayload = getQualityPayload(null); } catch(e) { msg.innerText = e.message; return; }
+
+      const { data: job, error } = await client.from("jobs").insert({
+        order_number: pendingStartData.pkaNumber,
+        employee_id: currentEmployee.id,
+        batch_number: pendingStartData.pkaNumber,
+        start_time: new Date().toISOString(),
+        status: "open"
+      }).select().single();
+
+      if (error) { msg.innerText = "שגיאה ביצירת עבודה: " + error.message; return; }
+
+      currentJob = job;
+      await saveLabel(pendingStartData.file, job.id, pendingStartData.pkaNumber, "start");
+
+      qualityPayload.job_id = job.id;
+      const { error: qError } = await client.from("lamination_quality").insert(qualityPayload);
+      if (qError) { msg.innerText = "שגיאה בשמירת איכות: " + qError.message; return; }
+
+      renderActiveJob();
+    }
+
+    function buildPublicLabelUrl(fileName) {
+      const encodedPath = fileName.split("/").map(encodeURIComponent).join("/");
+      return `${SUPABASE_URL}/storage/v1/object/public/labels/${encodedPath}`;
+    }
+
+    async function saveLabel(file, jobId, pkaNumber, labelType) {
+      const originalName = file.name || "label.jpg";
+      const ext = originalName.includes(".") ? originalName.split(".").pop() : "jpg";
+      const fileName = `${jobId}/${Date.now()}-${labelType}.${ext}`;
+      const publicUrl = buildPublicLabelUrl(fileName);
+
+      const { error: uploadError } = await client.storage
+        .from("labels")
+        .upload(fileName, file, {
+          cacheControl: "3600",
+          upsert: true,
+          contentType: file.type || "image/jpeg"
+        });
+
+      if (uploadError) {
+        console.error("שגיאה בהעלאת תווית:", uploadError);
+        alert("שגיאה בהעלאת תווית ל-Storage: " + uploadError.message);
+        return "";
+      }
+
+      const { error: insertError } = await client
+        .from("material_labels")
+        .insert({
+          job_id: jobId,
+          batch_number: pkaNumber,
+          label_type: labelType,
+          image_url: publicUrl
+        });
+
+      if (insertError) {
+        console.error("שגיאה בשמירת קישור תווית:", insertError);
+        alert("התמונה עלתה, אבל שמירת קישור התווית נכשלה: " + insertError.message);
+        return publicUrl;
+      }
+
+      return publicUrl;
+    }
+
+    function renderActiveJob() {
+      page(`
+        ${topBar("עבודה פעילה", `פק״ע: ${currentJob.batch_number}`)}
+        <section class="grid gap-4">
+          <div class="bg-green-900/40 border border-green-700 rounded-3xl p-5">
+            <h2 class="text-xl font-bold">למינציה 1 פעילה</h2>
+            <p class="text-gray-300 mt-2">שעת התחלה: ${new Date(currentJob.start_time).toLocaleTimeString("he-IL")}</p>
+          </div>
+
+          <div class="bg-gray-900 border border-gray-800 rounded-3xl p-5">
+            <h2 class="text-xl font-bold mb-4">טעינת גליל נוסף</h2>
+            <input id="extraLabelPhoto" type="file" accept="image/*" capture="environment" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-4">
+            <button onclick="addExtraRoll()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">צלם ושמור גליל נוסף</button>
+            <p id="activeMsg" class="mt-4 text-yellow-300"></p>
+          </div>
+
+          <button onclick="renderFinishJob()" class="w-full bg-orange-500 p-5 rounded-3xl text-xl font-bold">סיום עבודה</button>
+        </section>`);
+    }
+
+    async function addExtraRoll() {
+      const file = document.getElementById("extraLabelPhoto").files[0];
+      if (!file) return document.getElementById("activeMsg").innerText = "בחר/צלם תווית";
+      await saveLabel(file, currentJob.id, currentJob.batch_number, "extra_roll");
+      document.getElementById("activeMsg").innerText = "גליל נוסף נשמר";
+    }
+
+
+
+    function getLastDigits(value, count = 4) {
+      const digits = String(value || "").replace(/\D/g, "");
+      return digits.slice(-count).padStart(count, "0");
+    }
+
+    function formatLineTwoDigits(value) {
+      const digits = String(value || "").replace(/\D/g, "");
+      return (digits || "0").padStart(2, "0");
+    }
+
+    function getCurrentYearTwoDigits() {
+      return String(new Date().getFullYear()).slice(-2);
+    }
+
+    function buildShortQRFromJob(rollNumber = "") {
+      const baseQR = pendingOrderData?.qrCode || "";
+      if (baseQR) return rollNumber ? `${baseQR}.${rollNumber}` : baseQR;
+
+      const rawOrder = currentJob?.batch_number || currentJob?.order_number || pendingOrderData?.order || "";
+      const orderPart = getLastDigits(rawOrder, 4);
+      const yearPart = getCurrentYearTwoDigits();
+      const linePart = formatLineTwoDigits(pendingOrderData?.line || "1");
+      return rollNumber ? `${orderPart}.${yearPart}.${linePart}.${rollNumber}` : `${orderPart}.${yearPart}.${linePart}`;
+    }
+
+
+    function getMeasurementUnitForDepartment(department = "") {
+      const d = String(department || "").trim();
+      if (d.includes("שקיות")) return "יחידות";
+      return "מטרים";
+    }
+
+    function getCurrentDepartmentName() {
+      return currentJob?.department || "למינציה";
+    }
+
+    async function saveRollLabelRecord(label, isCopy = false) {
+      try {
+        const { error } = await client.from("roll_labels").insert({
+          qr_code: label.qrCode,
+          order_number: label.pka,
+          order_line: label.line,
+          roll_number: String(label.rollNumber || ""),
+          quantity: String(label.quantity || ""),
+          unit: label.unit || "",
+          customer_name: label.customer || "",
+          employee_name: label.operatorName || "",
+          operator_1: label.operatorName || "",
+          operator_2: label.operator2 || "",
+          shift_change_at: label.shiftChangeAt || null,
+          department: label.department || "",
+          printed_at: label.dateTimeIso || new Date().toISOString(),
+          original_printed_at: label.dateTimeIso || new Date().toISOString(),
+          is_copy: !!isCopy,
+          label_data: label
+        });
+        if (error) console.warn("שמירת תווית גליל נכשלה:", error.message);
+      } catch (e) {
+        console.warn("שמירת תווית גליל נכשלה:", e.message);
+      }
+    }
+
+    function exportRollLabelsExcel() {
+      if (!rollLabelsRowsForExport.length) {
+        alert("אין נתונים לייצוא. לחץ קודם רענן דוח תוויות.");
+        return;
+      }
+
+      const rows = rollLabelsRowsForExport.map(r => ({
+        "תאריך": r.printed_at ? new Date(r.printed_at).toLocaleString("he-IL") : "",
+        "QR": r.qr_code || "",
+        "פק״ע": r.order_number || "",
+        "שורה": r.order_line || "",
+        "גליל": r.roll_number || "",
+        "כמות": r.quantity || "",
+        "יחידה": r.unit || "",
+        "לקוח": r.customer_name || "",
+        "מפעיל": r.employee_name || "",
+        "מחלקה": r.department || "",
+        "סוג": r.is_copy ? "העתק" : "מקור"
+      }));
+
+      const ws = XLSX.utils.json_to_sheet(rows);
+      ws["!cols"] = Object.keys(rows[0]).map(() => ({ wch: 18 }));
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "תוויות גליל");
+
+      const today = new Date().toISOString().slice(0, 10);
+      XLSX.writeFile(wb, `digipack-roll-labels-${today}.xlsx`);
+    }
+
+
+    function printRollLabelFromReport(id) {
+      const row = rollLabelsRowsForExport.find(r => r.id === id) || workerRollLabelsRows.find(r => r.id === id);
+      if (!row) { alert("לא נמצאה תווית להדפסה"); return; }
+      openRollLabelsPrint(true, [buildLabelFromRollRow(row)]);
+    }
+
+    async function loadRollLabelsReport() {
+      const container = document.getElementById("rollLabelsReport");
+      if (!container) return;
+      container.innerHTML = "טוען תוויות גליל...";
+
+      const { data, error } = await client
+        .from("roll_labels")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      if (error) {
+        container.innerHTML = `<p class="text-red-400">שגיאה בטעינת תוויות גליל: ${escapeHtml(error.message)}</p>`;
+        return;
+      }
+
+      rollLabelsRowsForExport = data || [];
+
+      if (!data || !data.length) {
+        container.innerHTML = `<p class="text-gray-400">אין עדיין תוויות גליל שנשמרו.</p>`;
+        return;
+      }
+
+      container.innerHTML = `
+        <table class="w-full text-sm border-collapse">
+          <thead>
+            <tr>
+              ${["פעולה", "תאריך", "QR", "פק״ע", "שורה", "גליל", "כמות", "יחידה", "לקוח", "מפעיל", "סוג"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}
+            </tr>
+          </thead>
+          <tbody>
+            ${data.map(r => `
+              <tr>
+                <td class="border border-gray-700 p-2 whitespace-nowrap"><button onclick="printRollLabelFromReport('${r.id}')" class="bg-blue-600 px-3 py-2 rounded-xl font-bold text-xs">הדפס מחדש</button></td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${r.printed_at ? new Date(r.printed_at).toLocaleString("he-IL") : ""}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.qr_code || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.order_number || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.order_line || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.roll_number || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.quantity || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.unit || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.customer_name || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.employee_name || "")}</td>
+                <td class="border border-gray-700 p-2 whitespace-nowrap">${r.is_copy ? "העתק" : "מקור"}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>`;
+    }
+
+    function buildRollLabelPayload(rollNumber, quantity) {
+      const pka = pendingOrderData?.order || currentJob?.batch_number || currentJob?.order_number || "";
+      const line = pendingOrderData?.line || "";
+      const customer = pendingOrderData?.customer || "";
+      const product = pendingOrderData?.product || "";
+      const operatorName = currentEmployee?.name || "";
+      const now = new Date();
+      const department = getCurrentDepartmentName();
+      const unit = getMeasurementUnitForDepartment(department);
+      const qrCode = buildShortQRFromJob(rollNumber);
+      const jobRows = [{ line, pka, customer, product, quantity }];
+      return {
+        rollId: qrCode,
+        qrCode,
+        pka,
+        line,
+        customer,
+        product,
+        quantity,
+        unit,
+        rollNumber,
+        operatorName,
+        operator2: "",
+        shiftChangeAt: "",
+        department,
+        jobRows,
+        dateTime: now.toLocaleString("he-IL"),
+        dateTimeIso: now.toISOString()
+      };
+    }
+
+    function addRollInputRow() {
+      const container = document.getElementById("rollRows");
+      if (!container) return;
+      const index = container.children.length + 1;
+      const row = document.createElement("div");
+      row.className = "grid grid-cols-2 gap-3 bg-gray-800/50 rounded-2xl p-3";
+      row.innerHTML = `
+        <div>
+          <label class="block mb-2 text-sm text-gray-300">מספר גליל</label>
+          <input class="rollNumber w-full p-3 rounded-xl bg-gray-900 border border-gray-700" type="number" value="${index}">
+        </div>
+        <div>
+          <label class="block mb-2 text-sm text-gray-300">כמות בגליל</label>
+          <input class="rollQty w-full p-3 rounded-xl bg-gray-900 border border-gray-700" type="number" placeholder="מטרים / יחידות">
+        </div>`;
+      container.appendChild(row);
+    }
+
+    function collectRollsFromFinishForm() {
+      const rows = Array.from(document.querySelectorAll("#rollRows > div"));
+      return rows.map(row => {
+        const rollNumber = row.querySelector(".rollNumber")?.value || "";
+        const quantity = row.querySelector(".rollQty")?.value || "";
+        return { rollNumber, quantity };
+      }).filter(r => r.rollNumber && r.quantity);
+    }
+
+    async function openRollLabelsPrint(isCopy = false, presetLabels = null) {
+      const msg = document.getElementById("finishMsg") || document.getElementById("startMsg");
+      let labels = presetLabels;
+
+      if (!labels) {
+        const rolls = collectRollsFromFinishForm();
+        if (!rolls.length) {
+          if (msg) msg.innerText = "יש להזין לפחות גליל אחד עם כמות";
+          return;
+        }
+        labels = rolls.map(r => buildRollLabelPayload(r.rollNumber, r.quantity));
+      }
+
+      for (const label of labels) {
+        await saveRollLabelRecord(label, isCopy);
+      }
+
+      const printWindow = window.open("", "_blank", "width=1100,height=800");
+      if (!printWindow) {
+        if (msg) msg.innerText = "הדפדפן חסם חלון הדפסה. אפשר חלונות קופצים לאתר.";
+        return;
+      }
+
+      const labelsHtml = labels.map((label, i) => {
+        const jobRows = (label.jobRows && label.jobRows.length ? label.jobRows : [{
+          line: label.line || "",
+          pka: label.pka || "",
+          customer: label.customer || "",
+          product: label.product || "",
+          quantity: label.quantity || ""
+        }]);
+        return `
+        <section class="label">
+          <div class="logoBox">
+            <div class="dpLogo">
+              <div class="dpWord">DigiPack</div>
+              <div class="dpDots"><span></span><span></span><span></span></div>
+              <div class="dpSub">Optimized Packing</div>
+              <div class="dpStripes">
+                <i></i><i></i><i></i><i></i><i></i>
+              </div>
+            </div>
+          </div>
+          <div class="qrSide">
+            <canvas id="rollQr_${i}" width="185" height="185"></canvas>
+            <div class="scanText">סרוק לצפייה<br>במידע מלא</div>
+          </div>
+          ${isCopy ? `<div class="copyBadge">העתק</div>` : ""}
+
+          <div class="topGrid">
+            <div class="bigBox"><div class="labelTitle">פק״ע</div><div class="bigValue ltr">${escapeHtml(label.pka)}</div></div>
+            <div class="bigBox"><div class="labelTitle">גליל מספר</div><div class="bigValue ltr">${escapeHtml(label.rollNumber ? `G${label.rollNumber}` : label.rollId || "")}</div></div>
+            <div class="bigBox"><div class="labelTitle">תאריך הדפסה</div><div class="dateValue">${escapeHtml(label.dateTime || "")}</div></div>
+          </div>
+
+          <div class="middleGrid">
+            <div class="customerBox"><div class="labelTitle">לקוח</div><div class="customerValue">${escapeHtml(label.customer || "")}</div></div>
+            <div class="productBox"><div class="labelTitle">שם מוצר</div><div class="productValue">${escapeHtml(label.product || "")}</div></div>
+            <div class="lineBox"><div class="labelTitle">מספר שורה / שורות בגליל</div><div class="bigValue ltr">${escapeHtml(jobRows.map(r => r.line).filter(Boolean).join(", ") || label.line || "")}</div></div>
+          </div>
+
+          <div class="rowsAndOperators">
+            <div class="rowsBox">
+              <div class="blackTitle">שורות בגליל</div>
+              <table>
+                <thead><tr><th>מס׳ שורה</th><th>פק״ע</th><th>לקוח</th><th>מוצר</th></tr></thead>
+                <tbody>
+                  ${jobRows.map(r => `<tr><td>${escapeHtml(r.line || "")}</td><td class="ltr">${escapeHtml(r.pka || "")}</td><td>${escapeHtml(r.customer || "")}</td><td>${escapeHtml(r.product || "")}</td></tr>`).join("")}
+                </tbody>
+              </table>
+              <div class="note">גליל זה יכול להכיל מספר שורות / עבודות</div>
+            </div>
+            <div class="operatorsBox">
+              <div class="opTitle">מפעילים בגליל</div>
+              <div class="opLine"><span>מפעיל 1</span><strong>${escapeHtml(label.operatorName || "")}</strong></div>
+              ${label.operator2 ? `<div class="opLine"><span>מפעיל 2</span><strong>${escapeHtml(label.operator2 || "")}</strong></div>` : ""}
+              ${label.shiftChangeAt ? `<div class="shiftTime">שעת החלפה: ${escapeHtml(new Date(label.shiftChangeAt).toLocaleString("he-IL"))}</div>` : ""}
+            </div>
+          </div>
+
+          <div class="bottomBar">
+            <div class="rollIcon">◉</div>
+            <div><div class="labelTitle">אורך גליל</div><div class="lengthValue">${escapeHtml(label.quantity || "")} מ׳</div></div>
+            
+          </div>
+          <div class="footer">Digipack Optimized Packing | מערכת ניהול ייצור ואריזה | www.digipack.co.il</div>
+        </section>`;
+      }).join("");
+
+      printWindow.document.open();
+      printWindow.document.write(`
+        <!DOCTYPE html>
+        <html lang="he" dir="rtl">
+        <head>
+          <meta charset="UTF-8">
+          <title>תוויות גליל</title>
+          <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"><\/script>
+          <style>
+            @page { size: A6 landscape; margin: 4mm; }
+            html, body { margin: 0; padding: 0; font-family: Arial, sans-serif; direction: rtl; color: #111; background: white; width: 148mm; }
+            .label { position: relative; width: 140mm; height: 97mm; box-sizing: border-box; border: 2px solid #111; padding: 4mm 5mm; page-break-after: always; overflow: hidden; background: white; }
+            .logoBox { position:absolute; top:3mm; left:4mm; width:42mm; height:15mm; display:flex; align-items:flex-start; justify-content:flex-start; direction:ltr; overflow:hidden; }
+            .dpLogo { position:relative; width:42mm; height:15mm; direction:ltr; }
+            .dpWord { position:absolute; left:0; top:0; font-size:18px; font-weight:900; color:#16458f; line-height:1; letter-spacing:-.5px; }
+            .dpDots { position:absolute; left:7mm; top:8.5mm; display:flex; gap:6mm; }
+            .dpDots span { width:3mm; height:3mm; background:#78be20; border-radius:50%; display:block; }
+            .dpSub { position:absolute; left:0; top:11mm; font-size:6.5px; color:#555; font-weight:700; white-space:nowrap; }
+            .dpStripes { position:absolute; left:25mm; top:1.6mm; width:17mm; height:8mm; overflow:hidden; }
+            .dpStripes i { display:block; height:1.1mm; margin-bottom:.55mm; border-radius:3mm; transform-origin:left center; }
+            .dpStripes i:nth-child(1){ background:#78be20; transform:rotate(-3deg); }
+            .dpStripes i:nth-child(2){ background:#f28c28; transform:rotate(-1deg); }
+            .dpStripes i:nth-child(3){ background:#d31e6b; transform:rotate(1deg); }
+            .dpStripes i:nth-child(4){ background:#006ab6; transform:rotate(3deg); }
+            .dpStripes i:nth-child(5){ background:#9bd3f0; transform:rotate(5deg); }
+            .qrSide { position:absolute; top:4mm; right:4mm; width:31mm; text-align:center; }
+            .qrSide canvas { width:29mm!important; height:29mm!important; }
+            .scanText { margin-top:2mm; background:#000; color:#fff; border-radius:2mm; padding:2mm; font-weight:900; font-size:11px; line-height:1.25; }
+            .copyBadge { position:absolute; top:4mm; right:38mm; background:#000; color:#fff; border-radius:2mm; padding:2mm 7mm; font-size:18px; font-weight:900; border:1px solid #111; letter-spacing:1px; }
+            .topGrid { margin-top:16mm; margin-right:36mm; display:grid; grid-template-columns: 1fr 1fr 1fr; border-bottom:1.5px solid #111; }
+            .bigBox { min-height:18mm; border-left:1.2px solid #111; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+            .bigBox:last-child { border-left:none; }
+            .labelTitle { font-size:11px; font-weight:800; margin-bottom:1mm; }
+            .bigValue { font-size:25px; font-weight:900; letter-spacing:1px; }
+            .dateValue { font-size:15px; font-weight:900; direction:ltr; }
+            .middleGrid { margin-top:2mm; margin-right:36mm; display:grid; grid-template-columns: 1fr 1fr 1fr; min-height:20mm; border-bottom:1.5px solid #111; }
+            .customerBox, .productBox, .lineBox { display:flex; flex-direction:column; align-items:center; justify-content:center; border-left:1.2px solid #111; }
+            .lineBox { border-left:none; }
+            .customerValue { font-size:22px; font-weight:900; }
+            .productValue { font-size:14px; font-weight:900; text-align:center; line-height:1.15; max-height:15mm; overflow:hidden; }
+            .rowsAndOperators { margin-top:2mm; display:grid; grid-template-columns: 1fr 33mm; gap:2mm; }
+            .rowsBox, .operatorsBox { border:1.3px solid #111; border-radius:2mm; overflow:hidden; }
+            .blackTitle { background:#000; color:#fff; font-weight:900; text-align:center; padding:2mm; font-size:13px; }
+            table { width:100%; border-collapse:collapse; font-size:10px; }
+            th, td { border:1px dotted #777; padding:1.5mm; text-align:center; }
+            th { font-weight:900; }
+            .note { font-size:8px; padding:1mm 2mm; border-top:1px solid #111; }
+            .operatorsBox { padding:2mm; text-align:center; }
+            .opTitle { font-size:13px; font-weight:900; margin-bottom:2mm; }
+            .opLine { border-bottom:1px dotted #aaa; padding:1.5mm 0; }
+            .opLine span { display:block; font-size:9px; }
+            .opLine strong { font-size:15px; }
+            .shiftTime { margin-top:2mm; border-top:1px solid #111; padding-top:1.5mm; font-size:9px; font-weight:700; direction:ltr; }
+            .bottomBar { margin-top:2mm; border:1.3px solid #111; border-radius:2mm; min-height:14mm; display:flex; align-items:center; gap:5mm; padding:2mm 8mm; direction:rtl; }
+            .rollIcon { font-size:24px; transform:rotate(90deg); }
+            .lengthValue { font-size:24px; font-weight:900; direction:ltr; }
+            .footer { font-size:8px; text-align:center; margin-top:1.5mm; direction:ltr; }
+            .ltr { direction:ltr; unicode-bidi:embed; }
+          </style>
+        </head>
+        <body>
+          ${labelsHtml}
+          <script>
+            const labels = ${JSON.stringify(labels)};
+            window.onload = function() {
+              labels.forEach(function(label, i) {
+                const canvas = document.getElementById("rollQr_" + i);
+                if (canvas && window.QRious) {
+                  new QRious({ element: canvas, value: label.qrCode || label.rollId || "", size:185, level:"M", background:"white", foreground:"black" });
+                }
+              });
+              setTimeout(function(){ window.print(); }, 700);
+            };
+          <\/script>
+        </body>
+        </html>
+      `);
+      printWindow.document.close();
+    }
+
+    function renderFinishJob() {
+      page(`
+        ${topBar("סיום עבודה", `פק״ע: ${currentJob.batch_number}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <div>
+            <label class="block mb-2">כמות מטרים למעבר לתחנה הבאה</label>
+            <input id="transferMeters" type="number" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="הזן מטרים">
+          </div>
+
+          <div class="bg-gray-800/40 border border-gray-700 rounded-3xl p-4">
+            <h2 class="text-xl font-bold mb-3">תוויות גליל A6</h2>
+            <p class="text-gray-400 text-sm mb-3">אפשר להדפיס כמה תוויות לאותה עבודה. כל גליל מקבל מספר וכמות משלו.</p>
+            <div id="rollRows" class="space-y-3"></div>
+            <div class="grid md:grid-cols-2 gap-3 mt-4">
+              <button onclick="addRollInputRow()" class="w-full bg-purple-600 p-4 rounded-2xl font-bold">הוסף גליל</button>
+              <button onclick="openRollLabelsPrint()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">הדפס תוויות גליל</button>
+            </div>
+          </div>
+
+          <button onclick="finishJob()" class="w-full bg-green-600 p-5 rounded-3xl text-xl font-bold">סיים ושמור עבודה</button>
+          <button onclick="renderActiveJob()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור לעבודה פעילה</button>
+          <p id="finishMsg" class="mt-4 text-yellow-300"></p>
+        </section>`);
+      setTimeout(addRollInputRow, 50);
+    }
+
+    async function finishJob() {
+      const meters = document.getElementById("transferMeters").value;
+      if (!meters) return document.getElementById("finishMsg").innerText = "חובה להזין כמות מטרים";
+      const { error } = await client.from("jobs").update({
+        end_time: new Date().toISOString(),
+        status: "closed",
+        transfer_meters: Number(meters)
+      }).eq("id", currentJob.id);
+      if (error) return document.getElementById("finishMsg").innerText = "שגיאה בסגירת עבודה: " + error.message;
+
+      document.getElementById("app").innerHTML = `
+        <main class="min-h-screen flex items-center justify-center p-4">
+          <section class="bg-gray-900 border border-gray-800 rounded-3xl p-8 text-center max-w-md">
+            <h1 class="text-3xl font-bold text-green-400 mb-4">העבודה נסגרה בהצלחה</h1>
+            <p class="text-gray-300 mb-6">הנתונים נשמרו במערכת</p>
+            <button onclick="renderStartForm()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">פתח עבודה חדשה</button>
+          </section>
+        </main>`;
+    }
+
+    function getDateRange(period) {
+      const start = new Date();
+      const end = new Date();
+
+      if (period === "today") {
+        currentPeriodName = "היום";
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "yesterday") {
+        currentPeriodName = "אתמול";
+        start.setDate(start.getDate() - 1);
+        end.setDate(end.getDate() - 1);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "week") {
+        currentPeriodName = "שבוע נוכחי";
+        const day = start.getDay(); // Sunday = 0
+        start.setDate(start.getDate() - day);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "month") {
+        currentPeriodName = "חודש נוכחי";
+        start.setDate(1);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      if (period === "year") {
+        currentPeriodName = "שנה נוכחית";
+        start.setMonth(0,1);
+        start.setHours(0,0,0,0);
+        end.setHours(23,59,59,999);
+      }
+
+      return { start: start.toISOString(), end: end.toISOString() };
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+
+    async function refreshEmployeesAdmin() {
+      const tbody = document.getElementById("employeesTableBody");
+      const msg = document.getElementById("employeesMsg");
+      if (!tbody) return;
+
+      tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">טוען עובדים...</td></tr>`;
+
+      const { data, error } = await client
+        .from("employees")
+        .select("*")
+        .order("name");
+
+      if (error) {
+        tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-red-400">${escapeHtml(error.message)}</td></tr>`;
+        if (msg) msg.innerText = "שגיאה בטעינת עובדים";
+        return;
+      }
+
+      if (!data || !data.length) {
+        tbody.innerHTML = `<tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">אין עובדים במערכת</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = data.map(emp => `
+        <tr>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(emp.name)}</td>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">${emp.role === "manager" ? "מנהל" : "עובד"}</td>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">${emp.active ? "פעיל" : "לא פעיל"}</td>
+          <td class="border border-gray-700 p-2">
+            <input id="pwd_${emp.id}" type="text" placeholder="סיסמה חדשה" class="w-full min-w-40 p-2 rounded-xl bg-gray-800 border border-gray-700">
+          </td>
+          <td class="border border-gray-700 p-2 whitespace-nowrap">
+            <button onclick="updateEmployeePassword('${emp.id}')" class="bg-blue-600 px-3 py-2 rounded-xl text-sm font-bold">עדכן סיסמה</button>
+            <button onclick="toggleEmployeeActive('${emp.id}', ${emp.active ? "false" : "true"})" class="bg-orange-600 px-3 py-2 rounded-xl text-sm font-bold">${emp.active ? "השבת" : "הפעל"}</button>
+            <button onclick="setEmployeeRole('${emp.id}', '${emp.role === "manager" ? "operator" : "manager"}')" class="bg-purple-600 px-3 py-2 rounded-xl text-sm font-bold">${emp.role === "manager" ? "הפוך לעובד" : "הפוך למנהל"}</button>
+          </td>
+        </tr>
+      `).join("");
+
+      if (msg) msg.innerText = "";
+    }
+
+    async function createEmployeeAdmin() {
+      const msg = document.getElementById("employeesMsg");
+      const name = document.getElementById("newEmployeeName").value.trim();
+      const password = document.getElementById("newEmployeePassword").value.trim();
+      const role = document.getElementById("newEmployeeRole").value;
+
+      if (!name) { msg.innerText = "חובה להזין שם עובד"; return; }
+      if (!password) { msg.innerText = "חובה להזין סיסמה"; return; }
+
+      const { error } = await client.from("employees").insert({
+        name,
+        password,
+        role,
+        active: true
+      });
+
+      if (error) { msg.innerText = "שגיאה ביצירת עובד: " + error.message; return; }
+
+      document.getElementById("newEmployeeName").value = "";
+      document.getElementById("newEmployeePassword").value = "";
+      document.getElementById("newEmployeeRole").value = "operator";
+      msg.innerText = "העובד נוצר בהצלחה";
+      await refreshEmployeesAdmin();
+    }
+
+    async function updateEmployeePassword(employeeId) {
+      const msg = document.getElementById("employeesMsg");
+      const input = document.getElementById("pwd_" + employeeId);
+      const password = input.value.trim();
+
+      if (!password) { msg.innerText = "הזן סיסמה חדשה"; return; }
+
+      const { error } = await client
+        .from("employees")
+        .update({ password })
+        .eq("id", employeeId);
+
+      if (error) { msg.innerText = "שגיאה בעדכון סיסמה: " + error.message; return; }
+
+      input.value = "";
+      msg.innerText = "הסיסמה עודכנה";
+      await refreshEmployeesAdmin();
+    }
+
+    async function toggleEmployeeActive(employeeId, active) {
+      const msg = document.getElementById("employeesMsg");
+
+      const { error } = await client
+        .from("employees")
+        .update({ active })
+        .eq("id", employeeId);
+
+      if (error) { msg.innerText = "שגיאה בעדכון סטטוס עובד: " + error.message; return; }
+
+      msg.innerText = active ? "העובד הופעל" : "העובד הושבת";
+      await refreshEmployeesAdmin();
+    }
+
+    async function setEmployeeRole(employeeId, role) {
+      const msg = document.getElementById("employeesMsg");
+
+      const { error } = await client
+        .from("employees")
+        .update({ role })
+        .eq("id", employeeId);
+
+      if (error) { msg.innerText = "שגיאה בעדכון הרשאה: " + error.message; return; }
+
+      msg.innerText = "ההרשאה עודכנה";
+      await refreshEmployeesAdmin();
+    }
+
+
+
+    // ===============================
+    // V33 — TPI PRINT PLANNING MODULE
+    // This module is additive only. Existing lamination / labels / reports remain unchanged.
+    // ===============================
+
+    const PRINT_MATERIALS = [
+      "PET12", "PET12/760", "PET12/580", "PET MAT12", "PET MET12", "BOPP20", "BOPP MAT", "BOPP PG MAT",
+      "PE", "PEEVA23", "CPP", "PET/ALU/PE", "PET ALU PE 87", "PVDC", "BONYL", "TOPAZ", "HB", "CHROMO PAPER", "אחר"
+    ];
+    const ROLL_DIRECTIONS = ["עין ימין", "עין שמאל", "ראש", "רגל", "לא רלוונטי"];
+    const PRINT_SIDES = ["חיצונית", "פנימית"];
+    const PACKAGE_TYPES = ["גליל", "שקיות"];
+
+    let importedPriorityOrder = null;
+    let importedPriorityLines = [];
+
+    function normalizePriorityDate(value) {
+      const text = String(value || "").trim();
+      const m = text.match(/(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})/);
+      if (!m) return "";
+      const dd = m[1].padStart(2, "0");
+      const mm = m[2].padStart(2, "0");
+      let yy = m[3];
+      if (yy.length === 2) yy = "20" + yy;
+      return `${yy}-${mm}-${dd}`;
+    }
+
+    function normalizePriorityOrderNo(text) {
+      const raw = String(text || "").trim();
+      const m = raw.match(/(\d{6,12})\s*SO/i);
+      if (m) return m[1] + "SO";
+      const digits = raw.match(/\d{6,12}/);
+      return digits ? digits[0] : raw;
+    }
+
+    function cleanPriorityText(value) {
+      return String(value || "")
+        .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+        .replace(/\u00a0/g, " ");
+    }
+
+    function parsePriorityOrderText(text) {
+      const rawClean = cleanPriorityText(text);
+      const t = rawClean.replace(/\s+/g, " ").trim();
+      const result = {
+        order_number: "",
+        customer_name: "",
+        customer_po: "",
+        customer_no: "",
+        order_date: "",
+        lines: [],
+        raw_text: t
+      };
+
+      const orderMatch = t.match(/(?:אישור הזמנה מספר|ברקוד הזמנה)\s*:?\s*\*?\s*(SO\s*\d{6,12}|\d{6,12}\s*SO|\d{6,12})\*?/i) || t.match(/\b(SO\s*\d{6,12}|\d{6,12}\s*SO)\b/i);
+      if (orderMatch) result.order_number = normalizePriorityOrderNo(orderMatch[1]);
+
+      const dateMatch = t.match(/תאריך ההזמנה\s*:?\s*(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})/);
+      if (dateMatch) result.order_date = normalizePriorityDate(dateMatch[1]);
+
+      const poMatch = t.match(/הזמנתכם\s*:?\s*([A-Z]{0,3}\d{5,12}[A-Z]{0,3})/i);
+      if (poMatch) result.customer_po = poMatch[1].trim();
+
+      const custNoMatch = t.match(/מס\.?\s*לקוח\s*:?\s*(\d+)/);
+      if (custNoMatch) result.customer_no = custNoMatch[1];
+
+      const customerMatch = t.match(/לכבוד\s*:?\s*(.*?)\s+(?:המלאכה|טלפון|אישור הזמנה מספר|אישור הזמנה)/);
+      if (customerMatch) result.customer_name = customerMatch[1].trim();
+
+      const startCandidates = [t.indexOf("שורה"), t.indexOf("תאור מוצר"), t.indexOf("תיאור מוצר"), t.indexOf("סה\"כ מחיר")].filter(x => x >= 0);
+      const tableStart = startCandidates.length ? Math.min(...startCandidates) : 0;
+      const endCandidates = [t.indexOf("מחיר כולל", tableStart + 10), t.indexOf("ברקוד הזמנה", tableStart + 10), t.indexOf("תנאי תשלום", tableStart + 10)].filter(x => x > tableStart);
+      const tableText = t.slice(tableStart, endCandidates.length ? Math.min(...endCandidates) : undefined);
+
+      function addLine(line) {
+        if (!line || !line.order_line) line.order_line = String(result.lines.length + 1);
+        if (/הובלה|עלות הובלה/i.test(line.product_name || "") || /הובלה/i.test(line.sku || "")) return;
+        const exists = result.lines.some(r => String(r.order_line) === String(line.order_line) && String(r.sku) === String(line.sku));
+        if (!exists) result.lines.push(line);
+      }
+
+      // Priority PDF extraction is not always in the same visual order. Support both:
+      // date + unit + qty ... sku + line, and date + qty + unit ... sku + line.
+      const lineRegexes = [
+        /(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})\s+יח\s+([\d,]+(?:\.\d+)?)\s+(.+?)\s+(\d{6,14}|[A-Z0-9][A-Z0-9\-\/.]{2,})\s+(\d{1,3})\b/g,
+        /(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})\s+([\d,]+(?:\.\d+)?)\s*יח\s+(.+?)\s+(\d{6,14}|[A-Z0-9][A-Z0-9\-\/.]{2,})\s+(\d{1,3})\b/g
+      ];
+      for (const rx of lineRegexes) {
+        let m;
+        while ((m = rx.exec(tableText)) !== null) {
+          const description = (m[3] || "").replace(/ILS\s*[\d,.]+/g, "").trim();
+          addLine({
+            order_line: m[5],
+            sku: m[4],
+            product_name: description,
+            quantity: m[2].replace(/,/g, ""),
+            due_date: normalizePriorityDate(m[1])
+          });
+        }
+      }
+
+      if (!result.lines.length) {
+        const chunkRegex = /(\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4})(.*?)(?=\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4}|מחיר כולל|ברקוד הזמנה|תנאי תשלום|$)/g;
+        let m;
+        while ((m = chunkRegex.exec(tableText)) !== null) {
+          const due = m[1];
+          let chunk = (m[2] || "").trim();
+          if (!/יח/.test(chunk) || /הובלה|עלות הובלה/.test(chunk)) continue;
+
+          const qtyMatch = chunk.match(/יח\s*([\d,]+(?:\.\d+)?)/) || chunk.match(/([\d,]+(?:\.\d+)?)\s*יח/);
+          const quantity = qtyMatch ? qtyMatch[1].replace(/,/g, "") : "";
+
+          const skuMatches = Array.from(chunk.matchAll(/\b(\d{6,14}|[A-Z]{1,}[A-Z0-9\-\/.]{2,})\b/g)).map(x => x[1]).filter(x => !/^ILS$/i.test(x));
+          const sku = skuMatches.length ? skuMatches[skuMatches.length - 1] : "";
+          if (!sku && !quantity) continue;
+
+          let lineNo = "";
+          if (sku) {
+            const afterSku = chunk.slice(chunk.lastIndexOf(sku) + sku.length);
+            const lineMatch = afterSku.match(/\b(\d{1,3})\b/);
+            if (lineMatch) lineNo = lineMatch[1];
+          }
+
+          let product = chunk;
+          product = product.replace(/ILS\s*[\d,.]+/gi, " ").replace(/[\d,.]+\s*ILS/gi, " ");
+          product = product.replace(/יח\s*[\d,]+(?:\.\d+)?|[\d,]+(?:\.\d+)?\s*יח/g, " ");
+          if (sku) product = product.replace(sku, " ");
+          if (lineNo) product = product.replace(new RegExp("\\b" + lineNo + "\\b$"), " ");
+          product = product.replace(/\s+/g, " ").trim();
+
+          addLine({
+            order_line: lineNo || String(result.lines.length + 1),
+            sku,
+            product_name: product,
+            quantity,
+            due_date: normalizePriorityDate(due)
+          });
+        }
+      }
+
+      return result;
+    }
+
+    async function readPdfTextFromFile(file) {
+      if (!window.pdfjsLib) throw new Error("ספריית PDF לא נטענה. בדוק חיבור אינטרנט ורענן את הדף.");
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      const buffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+      let fullText = "";
+      for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
+        const page = await pdf.getPage(pageNo);
+        const content = await page.getTextContent();
+        fullText += content.items.map(item => item.str).join(" ") + "\n";
+      }
+      return fullText;
+    }
+
+    function fillTpiHeaderFromImportedOrder(order) {
+      const orderNo = document.getElementById("tpiOrderNo");
+      const customer = document.getElementById("tpiCustomer");
+      const customerPo = document.getElementById("tpiCustomerPo");
+      const orderDate = document.getElementById("tpiOrderDate");
+      if (orderNo) orderNo.value = order.order_number || "";
+      if (customer) customer.value = order.customer_name || "";
+      if (customerPo) customerPo.value = order.customer_po || "";
+      if (orderDate && order.order_date) orderDate.value = order.order_date;
+    }
+
+    function fillTpiLineFormFromImportedLine(index) {
+      const line = importedPriorityLines[Number(index)];
+      if (!line) return;
+      const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ""; };
+      set("tpiLineNo", line.order_line);
+      set("tpiSku", line.sku);
+      set("tpiProduct", line.product_name);
+      set("tpiQty", line.quantity);
+      set("tpiDueDate", line.due_date);
+      updateTpiPreview();
+      const msg = document.getElementById("tpiMsg");
+      if (msg) msg.innerText = "השורה נטענה לטופס. השלם תהליך/חומר/רוחב/פסיעה ואז לחץ הוסף שורה לפק״ע.";
+    }
+
+    function renderImportedPriorityPreview() {
+      const el = document.getElementById("priorityPdfPreview");
+      if (!el || !importedPriorityOrder) return;
+      el.innerHTML = `
+        <div class="bg-blue-900/25 border border-blue-700 rounded-2xl p-4">
+          <div class="font-bold text-blue-200 mb-2">הזמנה שנקראה מה-PDF</div>
+          <div class="grid md:grid-cols-4 gap-2 text-sm">
+            <div>הזמנה: <span class="font-bold ltr">${escapeHtml(importedPriorityOrder.order_number || "")}</span></div>
+            <div>לקוח: <span class="font-bold">${escapeHtml(importedPriorityOrder.customer_name || "")}</span></div>
+            <div>הזמנת לקוח: <span class="font-bold ltr">${escapeHtml(importedPriorityOrder.customer_po || "")}</span></div>
+            <div>תאריך: <span class="font-bold ltr">${escapeHtml(importedPriorityOrder.order_date || "")}</span></div>
+          </div>
+          ${!importedPriorityLines.length ? `<p class="text-red-300 mt-3">לא זוהו שורות הזמנה אוטומטית. אפשר למלא ידנית בשדות למטה.</p>` : `
+            <div class="overflow-auto mt-4">
+              <table class="w-full text-sm border-collapse">
+                <thead><tr>${["פעולה","שורה","מק״ט","תיאור מוצר","כמות","אספקה"].map(h => `<th class="border border-blue-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead>
+                <tbody>${importedPriorityLines.map((r,i) => `<tr>
+                  <td class="border border-blue-700 p-2"><button onclick="fillTpiLineFormFromImportedLine(${i})" class="bg-blue-600 px-3 py-2 rounded-xl text-xs font-bold">טען לטופס</button></td>
+                  <td class="border border-blue-700 p-2">${escapeHtml(r.order_line)}</td>
+                  <td class="border border-blue-700 p-2 ltr">${escapeHtml(r.sku)}</td>
+                  <td class="border border-blue-700 p-2">${escapeHtml(r.product_name)}</td>
+                  <td class="border border-blue-700 p-2 ltr">${escapeHtml(r.quantity)}</td>
+                  <td class="border border-blue-700 p-2 ltr">${escapeHtml(r.due_date)}</td>
+                </tr>`).join("")}</tbody>
+              </table>
+            </div>`}
+        </div>`;
+    }
+
+    async function importPriorityPdfToTpi() {
+      const file = document.getElementById("priorityPdfFile")?.files?.[0];
+      const msg = document.getElementById("priorityPdfMsg");
+      if (!file) { if (msg) msg.innerText = "בחר קובץ PDF של הזמנה"; return; }
+      if (!/\.pdf$/i.test(file.name)) { if (msg) msg.innerText = "הקובץ חייב להיות PDF"; return; }
+      try {
+        if (msg) msg.innerText = "קורא PDF...";
+        const text = await readPdfTextFromFile(file);
+        importedPriorityOrder = parsePriorityOrderText(text);
+        importedPriorityLines = importedPriorityOrder.lines || [];
+        fillTpiHeaderFromImportedOrder(importedPriorityOrder);
+        renderImportedPriorityPreview();
+        if (msg) msg.innerText = importedPriorityLines.length
+          ? `נקלט PDF. נמצאו ${importedPriorityLines.length} שורות. בדוק וטען כל שורה לטופס.`
+          : "נקלט PDF אך לא זוהו שורות. אפשר למלא ידנית או לשלוח לי דוגמה נוספת לשיפור הפענוח.";
+      } catch (e) {
+        if (msg) msg.innerText = "שגיאה בקריאת PDF: " + e.message;
+      }
+    }
+
+
+    let tpiSourceOrderLines = [];
+
+    async function loadTpiOrderLines() {
+      const container = document.getElementById("tpiOrderLinesSource");
+      const msg = document.getElementById("tpiMsg");
+      if (!container) return;
+      container.innerHTML = `<p class="text-gray-400">טוען שורות הזמנה קיימות...</p>`;
+      const { data, error } = await client
+        .from("order_lines")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(500);
+      if (error) {
+        container.innerHTML = `<p class="text-red-400">שגיאה בטעינת order_lines: ${escapeHtml(error.message)}</p>`;
+        if (msg) msg.innerText = "ודא שדוח ההזמנות עם QR כבר נשמר ל-order_lines.";
+        return;
+      }
+      tpiSourceOrderLines = data || [];
+      drawTpiOrderLinesSource(tpiSourceOrderLines);
+    }
+
+    function filterTpiOrderLines() {
+      const q = String(document.getElementById("tpiOrderSearch")?.value || "").trim().toLowerCase();
+      if (!q) return drawTpiOrderLinesSource(tpiSourceOrderLines);
+      const filtered = tpiSourceOrderLines.filter(r => [r.order_number, r.order_line, r.customer_name, r.product_name, r.qr_code]
+        .some(v => String(v || "").toLowerCase().includes(q)));
+      drawTpiOrderLinesSource(filtered);
+    }
+
+    function drawTpiOrderLinesSource(rows) {
+      const container = document.getElementById("tpiOrderLinesSource");
+      if (!container) return;
+      if (!rows || !rows.length) {
+        container.innerHTML = `<p class="text-gray-400">אין שורות ב-order_lines. קודם העלה דוח הזמנות וייצר QR במסך הקיים.</p>`;
+        return;
+      }
+      container.innerHTML = `
+        <div class="overflow-auto max-h-[360px] border border-gray-700 rounded-2xl">
+          <table class="w-full text-sm border-collapse">
+            <thead class="sticky top-0"><tr>${["פעולה","QR","הזמנה","שורה","מק״ט","לקוח","מוצר","כמות","תאריך אספקה","תהליך"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead>
+            <tbody>${rows.map(r => `<tr>
+              <td class="border border-gray-700 p-2 whitespace-nowrap"><button onclick="loadOrderLineToTpi('${r.id}')" class="bg-blue-600 px-3 py-2 rounded-xl text-xs font-bold">טען לתפ״י</button></td>
+              <td class="border border-gray-700 p-2 ltr whitespace-nowrap">${escapeHtml(r.qr_code || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.order_number || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.order_line || "")}</td>
+              <td class="border border-gray-700 p-2 ltr whitespace-nowrap">${escapeHtml(r.sku || r.raw_data?.sku || r.raw_data?.["מק\"ט"] || r.raw_data?.["מקט"] || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.customer_name || "")}</td>
+              <td class="border border-gray-700 p-2 min-w-[220px]">${escapeHtml(r.product_name || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.quantity || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.due_date || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.process_text || getProcessText(r.process_id) || "")}</td>
+            </tr>`).join("")}</tbody>
+          </table>
+        </div>`;
+    }
+
+    function normalizeDateInput(value) {
+      const text = String(value || "").trim();
+      if (!text) return "";
+      if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+      const m = text.match(/(\d{1,2})[\/\.\-](\d{1,2})[\/\.\-](\d{2,4})/);
+      if (m) {
+        const y = m[3].length === 2 ? "20" + m[3] : m[3];
+        return `${y}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+      }
+      return "";
+    }
+
+    function loadOrderLineToTpi(id) {
+      const row = tpiSourceOrderLines.find(r => String(r.id) === String(id));
+      if (!row) return;
+      const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value || ""; };
+      set("tpiOrderNo", row.order_number || "");
+      set("tpiCustomer", row.customer_name || "");
+      set("tpiCustomerPo", row.raw_data?.customer_po || row.raw_data?.["הזמנתכם"] || "");
+      set("tpiLineNo", row.order_line || "");
+      set("tpiSku", row.raw_data?.sku || row.raw_data?.["מק\"ט"] || row.raw_data?.["מקט"] || "");
+      set("tpiProduct", row.product_name || "");
+      set("tpiQty", String(row.quantity || "").replace(/[^0-9.]/g, ""));
+      set("tpiDueDate", normalizeDateInput(row.due_date || row.raw_data?.dueDate || row.raw_data?.["תאריך אספקה"]));
+      if (row.process_id) set("tpiProcessId", normalizeProcessId(row.process_id));
+      const msg = document.getElementById("tpiMsg");
+      if (msg) msg.innerText = `נטענה שורה ${row.order_line || ""} מהזמנה ${row.order_number || ""}. השלם נתוני תפ״י ולחץ הוסף שורה לפק״ע.`;
+      window.currentTpiSourceOrderLine = row;
+      updateTpiPreview();
+    }
+
+    let tpiLines = [];
+    let tpiLineGraphicFiles = {};
+    let tpiPrintFiles = [];
+    let currentPrintFileData = null;
+    let currentPrintJob = null;
+    let currentTpiEditMode = false;
+    let currentTpiEditOrderNo = "";
+    let currentTpiEditingLineData = null;
+
+    function getTpiOrderNo() { return document.getElementById("tpiOrderNo")?.value.trim() || ""; }
+    function getTpiYear2() {
+      const d = document.getElementById("tpiOrderDate")?.value;
+      if (d && /^\d{4}-/.test(d)) return d.slice(2,4);
+      return String(new Date().getFullYear()).slice(-2);
+    }
+    function buildTpiWorkOrderNo(orderNo) {
+      return `${getLastDigits(orderNo, 4)}.${getTpiYear2()}`;
+    }
+    function buildTpiJobNo(orderNo, lineNo) {
+      // Internal unique key per line. Displayed work order number is buildTpiWorkOrderNo(orderNo), without line suffix.
+      return `${getLastDigits(orderNo, 4)}.${getTpiYear2()}.${formatLineTwoDigits(lineNo || "1")}`;
+    }
+    function displayWorkOrderNo(value) {
+      const s = String(value || "").trim();
+      const m = s.match(/^(\d{4}\.\d{2})/);
+      return m ? m[1] : s;
+    }
+    function buildPrintFileQR(orderNo, fileNo) {
+      return `${getLastDigits(orderNo, 4)}.${getTpiYear2()}.F${String(fileNo || 1).padStart(2, "0")}`;
+    }
+    function parseFileComposition(text) {
+      // Supports both formats:
+      // 1+1+10+13  => each number is one appearance in the file
+      // 1x2, 2x1   => line 1 appears twice, line 2 once
+      const raw = String(text || "").trim();
+      if (!raw) return [];
+
+      // New preferred format: 1+1+10+13
+      if (raw.includes("+")) {
+        return raw
+          .split("+")
+          .map(part => part.trim())
+          .filter(Boolean)
+          .map(line => ({ line: String(line).replace(/\D/g, "") || String(line), repeats: 1 }))
+          .filter(item => item.line);
+      }
+
+      // Backward-compatible format: 1x2, 2x1 OR 1:2,2:1
+      return raw.split(/[;,\n]/).map(part => part.trim()).filter(Boolean).flatMap(part => {
+        const m = part.match(/(\d+)\s*[xX:*]\s*(\d+)/);
+        if (m) {
+          const line = m[1];
+          const repeats = Math.max(1, Number(m[2]) || 1);
+          return Array.from({ length: repeats }, () => ({ line, repeats: 1 }));
+        }
+        const single = part.match(/^\d+$/);
+        return single ? [{ line: part, repeats: 1 }] : [];
+      });
+    }
+
+    function normalizeFileCompositionText(text) {
+      const composition = parseFileComposition(text);
+      return composition.map(item => item.line).join("+");
+    }
+
+    function toNullableNumber(value) {
+      if (value === "" || value === null || value === undefined) return null;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
+    function calcTotalWidth(lineWidth, rowsCount) {
+      return (Number(lineWidth) || 0) * (Number(rowsCount) || 0);
+    }
+    function calcPrintWaste(filesCount) {
+      const n = Math.max(1, Number(filesCount) || 1);
+      if (n === 1) return 150; // first 100 + last 50
+      return 100 + Math.max(0, n - 2) * 20 + 50;
+    }
+    function calcBasePrintMeters(packageType, qty, rowsCount) {
+      const q = Number(qty) || 0;
+      const rows = Math.max(1, Number(rowsCount) || 1);
+      if (packageType === "גליל") return q / rows;
+      return q / rows; // for bags, this is still a print-meter base until the Excel formula is fully migrated.
+    }
+    function calcTotalPrintMeters(packageType, qty, rowsCount, filesCount) {
+      return Math.ceil(calcBasePrintMeters(packageType, qty, rowsCount) + calcPrintWaste(filesCount));
+    }
+
+    function renderNewTpiPrintPlanner() {
+      currentTpiEditMode = false;
+      currentTpiEditOrderNo = "";
+      currentTpiEditingLineData = null;
+      tpiLines = [];
+      tpiLineGraphicFiles = {};
+      tpiPrintFiles = [];
+      renderTpiPrintPlanner();
+    }
+
+    function renderTpiPrintPlanner() {
+      page(`
+        ${topBar("V34.6 — תפ״י לדפוס", `מנהל: ${currentEmployee.name}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-5">
+          <div class="bg-green-900/25 border border-green-700 rounded-2xl p-4 text-sm text-green-100">
+            גרסה זו מבוססת על <b>order_lines</b> הקיים מדוח ההזמנות שכבר עובד. הפק״ע נשמרת כפק״ע פתוחה לדפוס, כולל מק״ט, תיאור מוצר, PDF גרפי לכל שורה וכמות הדפסה ידנית לכל קובץ.
+          </div>
+
+          <h2 class="text-xl font-bold">בחירת שורה מדוח הזמנות קיים</h2>
+          <div class="bg-gray-800/50 border border-gray-700 rounded-2xl p-4 space-y-3">
+            <p class="text-gray-400 text-sm">בחר שורת הזמנה שכבר נקלטה מה-Excel של פריוריטי. לאחר הטעינה תפ״י משלים את נתוני הדפוס.</p>
+            <div class="grid md:grid-cols-[1fr_auto_auto] gap-3">
+              <input id="tpiOrderSearch" oninput="filterTpiOrderLines()" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="חיפוש לפי הזמנה / לקוח / מוצר / QR">
+              <button onclick="loadTpiOrderLines()" class="bg-blue-600 px-5 py-4 rounded-2xl font-bold">רענן שורות</button>
+              <button onclick="tpiLines=[]; tpiPrintFiles=[]; drawTpiTables(); updateTpiPreview();" class="bg-gray-700 px-5 py-4 rounded-2xl font-bold">נקה פק״ע</button>
+            </div>
+            <div id="tpiOrderLinesSource"></div>
+          </div>
+
+          <h2 class="text-xl font-bold">נתוני הזמנה</h2>
+          <div class="grid md:grid-cols-4 gap-3">
+            <div class="dg-field"><label>מספר הזמנה</label><input id="tpiOrderNo" placeholder="לדוגמה SO26000760"></div>
+            <div class="dg-field"><label>לקוח</label><input id="tpiCustomer" placeholder="שם לקוח"></div>
+            <div class="dg-field"><label>הזמנת לקוח</label><input id="tpiCustomerPo" placeholder="PO לקוח אם קיים"></div>
+            <div class="dg-field"><label>תאריך הזמנה</label><input id="tpiOrderDate" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
+          </div>
+
+          <h2 class="text-xl font-bold">פרטי פק״ע</h2>
+          <div class="grid md:grid-cols-4 gap-3">
+            <div class="dg-field"><label>שם מתכנן</label><input id="tpiPlannedBy" value="${escapeHtml(currentEmployee?.name || '')}" readonly></div>
+            <div class="dg-field"><label>סוג עבודה</label><select id="tpiJobType"><option>עבודה חדשה</option><option>עבודה חוזרת</option></select></div>
+            <div class="dg-field"><label>גורם מאשר</label><select id="tpiApprovalSource"><option>מנהל</option><option>דפוס</option><option>לקוח</option></select></div>
+            <div class="dg-field"><label>סטטוס</label><input id="tpiStatus" value="פתוחה לדפוס" readonly></div>
+          </div>
+          <div class="dg-field">
+            <label>הערות תפ״י</label>
+            <textarea id="tpiNotes" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 min-h-[90px]" placeholder="לדוגמה: לבדוק ברקוד בתחילת ריצה, להדפיס לפי דוגמה מאושרת"></textarea>
+          </div>
+
+          <h2 class="text-xl font-bold">שורת הזמנה / פק״ע</h2>
+          <div class="grid md:grid-cols-5 gap-3">
+            <div class="dg-field"><label>מספר שורה בהזמנה</label><input id="tpiLineNo" type="number" placeholder="לדוגמה 1"></div>
+            <div class="dg-field"><label>מק״ט</label><input id="tpiSku" placeholder="מק״ט מוצר"></div>
+            <div class="dg-field"><label>תיאור מוצר</label><input id="tpiProduct" placeholder="שם / תיאור מוצר"></div>
+            <div class="dg-field"><label>כמות ERP / מטרים נדרשים</label><input id="tpiQty" type="number" oninput="updateTpiPreview()" placeholder="לדוגמה 1000"></div>
+            <div class="dg-field"><label>תאריך אספקה</label><input id="tpiDueDate" type="date"></div>
+          </div>
+
+          <div class="grid md:grid-cols-4 gap-3">
+            <div class="dg-field"><label>תהליך ייצור</label><select id="tpiProcessId">
+              <option value="">בחר תהליך</option>
+              ${Object.keys(PRODUCTION_PROCESSES).map(id => `<option value="${id}">${id} — ${escapeHtml(getProcessText(id))}</option>`).join("")}
+            </select></div>
+            <div class="dg-field"><label>סוג אריזה</label><select id="tpiPackageType" onchange="updateTpiPreview()">${PACKAGE_TYPES.map(x => `<option>${x}</option>`).join("")}</select></div>
+            <div class="dg-field"><label>הדפסה פנימית / חיצונית</label><select id="tpiPrintSide">${PRINT_SIDES.map(x => `<option>${x}</option>`).join("")}</select></div>
+            <div class="dg-field"><label>כיוון גלגול</label><select id="tpiRollDirection">${ROLL_DIRECTIONS.map(x => `<option>${x}</option>`).join("")}</select></div>
+          </div>
+
+          <div class="grid md:grid-cols-5 gap-3">
+            <div class="dg-field"><label>חומר הדפסה</label><select id="tpiPrintMaterial" onchange="toggleCustomPrintMaterial()">${PRINT_MATERIALS.map(x => `<option>${x}</option>`).join("")}</select></div>
+            <div class="dg-field"><label>חומר ידני</label><input id="tpiPrintMaterialCustom" class="hidden" placeholder="הקלד חומר אם בחרת אחר"></div>
+            <div class="dg-field"><label>פסיעה</label><input id="tpiPitch" type="number" placeholder="לדוגמה 23"></div>
+            <div class="dg-field"><label>רוחב שורה</label><input id="tpiLineWidth" type="number" oninput="updateTpiPreview()" placeholder="לדוגמה 25"></div>
+            <div class="dg-field"><label>מספר שורות לרוחב</label><input id="tpiRowsAcross" type="number" oninput="updateTpiPreview()" placeholder="לדוגמה 2"></div>
+          </div>
+
+          <div class="bg-gray-800/50 border border-gray-700 rounded-2xl p-4">
+            <h3 class="font-bold text-lg mb-3">קובץ PDF גרפי לשורה</h3>
+            <div class="dg-field">
+              <label>PDF גרפי מאושר</label>
+              <input id="tpiGraphicPdfFile" type="file" accept="application/pdf,.pdf">
+            </div>
+            <p class="dg-pdf-note mt-2">בשלב זה הקובץ נשמר וצמוד לשורת הפק״ע. בהמשך נשתמש בו לבקרת AI מול צילום הדפסה.</p>
+          </div>
+
+          <div id="tpiCalcPreview" class="dg-calc-field">רוחב כולל וכמות הדפסה יחושבו לאחר הזנת נתונים.</div>
+
+          <button onclick="addTpiLine()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">הוסף שורה לפק״ע</button>
+          <div id="tpiLinesTable" class="overflow-auto"></div>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mt-5 space-y-4">
+          <h2 class="text-xl font-bold">קבצי הדפסה</h2>
+          <p class="text-gray-400 text-sm">בשדה הרכב קובץ כתוב את מספרי השורות לפי הסדר, לדוגמה: <span class="ltr">1+1+10+13</span>. אם אותה שורה מופיעה פעמיים — כותבים אותה פעמיים. אותה שורה יכולה להופיע גם בקובץ הבא.</p>
+          <div class="grid md:grid-cols-5 gap-3 items-end">
+            <div class="dg-field"><label>מספר קובץ</label><input id="printFileNo" type="number" placeholder="לדוגמה 1" value="1"></div>
+            <div class="dg-field"><label>שם קובץ הדפסה</label><input id="printFileName" placeholder="שם הקובץ בדפוס"></div>
+            <div class="dg-field"><label>הרכב שורות בקובץ</label><input id="printFileComposition" class="ltr" placeholder="לדוגמה 1+1+10+13"></div>
+            <div class="dg-field"><label>כמות להדפסה לקובץ</label><input id="printFileQuantity" type="number" placeholder="מטרים / יחידות"></div>
+            <button onclick="addPrintFilePlan()" class="bg-purple-600 p-4 rounded-2xl font-bold">הוסף קובץ</button>
+          </div>
+          <div id="printFilesTable" class="overflow-auto"></div>
+          <div class="grid md:grid-cols-2 gap-3">
+            <button onclick="saveTpiPrintPlan()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">שמור תפ״י ודפוס</button>
+            <button onclick="printTpiFileQrLabels()" class="w-full bg-pink-700 p-4 rounded-2xl font-bold">הדפס QR לקבצי הדפסה</button>
+          </div>
+          <p id="tpiMsg" class="text-yellow-300"></p>
+          <div id="tpiQrLabels" class="grid grid-cols-2 md:grid-cols-3 gap-4"></div>
+        </section>
+      `);
+      drawTpiTables();
+      updateTpiPreview();
+      loadTpiOrderLines();
+    }
+
+    function toggleCustomPrintMaterial() {
+      const sel = document.getElementById("tpiPrintMaterial");
+      const custom = document.getElementById("tpiPrintMaterialCustom");
+      if (!sel || !custom) return;
+      custom.classList.toggle("hidden", sel.value !== "אחר");
+    }
+    function getSelectedPrintMaterial() {
+      const sel = document.getElementById("tpiPrintMaterial")?.value || "";
+      if (sel === "אחר") return document.getElementById("tpiPrintMaterialCustom")?.value.trim() || "אחר";
+      return sel;
+    }
+    function updateTpiPreview() {
+      const el = document.getElementById("tpiCalcPreview");
+      if (!el) return;
+      const qty = Number(document.getElementById("tpiQty")?.value || 0);
+      const rowsAcross = Number(document.getElementById("tpiRowsAcross")?.value || 0);
+      const lineWidth = Number(document.getElementById("tpiLineWidth")?.value || 0);
+      const filesCount = Math.max(1, tpiPrintFiles.length || 1);
+      const packageType = document.getElementById("tpiPackageType")?.value || "גליל";
+      const totalWidth = calcTotalWidth(lineWidth, rowsAcross);
+      const baseMeters = calcBasePrintMeters(packageType, qty, rowsAcross);
+      const waste = calcPrintWaste(filesCount);
+      const totalMeters = calcTotalPrintMeters(packageType, qty, rowsAcross, filesCount);
+      el.innerHTML = `רוחב כולל: ${totalWidth || 0} מ״מ | בסיס להדפסה: ${Math.ceil(baseMeters || 0)} מ׳ | פחת קבצים: ${waste} מ׳ | סה״כ להדפסה: ${totalMeters || 0} מ׳`;
+    }
+
+    function addTpiLine() {
+      const orderNo = getTpiOrderNo();
+      const lineNo = document.getElementById("tpiLineNo")?.value.trim();
+      const customer = document.getElementById("tpiCustomer")?.value.trim();
+      const product = document.getElementById("tpiProduct")?.value.trim();
+      const qty = document.getElementById("tpiQty")?.value.trim();
+      if (!orderNo || !lineNo || !customer || !product || !qty) { document.getElementById("tpiMsg").innerText = "חובה להזין הזמנה, לקוח, שורה, מוצר וכמות"; return; }
+      const rowsAcross = Number(document.getElementById("tpiRowsAcross")?.value || 1);
+      const lineWidth = Number(document.getElementById("tpiLineWidth")?.value || 0);
+      const filesCount = Math.max(1, tpiPrintFiles.length || 1);
+      const packageType = document.getElementById("tpiPackageType")?.value || "גליל";
+      const graphicInput = document.getElementById("tpiGraphicPdfFile");
+      const graphicFile = graphicInput?.files?.[0] || null;
+      if (graphicFile && !(/\.pdf$/i.test(graphicFile.name) || graphicFile.type === "application/pdf")) {
+        document.getElementById("tpiMsg").innerText = "קובץ גרפי חייב להיות PDF";
+        return;
+      }
+      const graphicFileKey = graphicFile ? `g_${Date.now()}_${Math.random().toString(36).slice(2)}` : "";
+      if (graphicFile) tpiLineGraphicFiles[graphicFileKey] = graphicFile;
+      const row = {
+        order_number: orderNo,
+        customer_name: customer,
+        customer_po: document.getElementById("tpiCustomerPo")?.value.trim() || "",
+        order_line: lineNo,
+        sku: document.getElementById("tpiSku")?.value.trim() || "",
+        product_name: product,
+        quantity: qty,
+        due_date: document.getElementById("tpiDueDate")?.value || null,
+        work_order_no: buildTpiWorkOrderNo(orderNo),
+        job_no: buildTpiJobNo(orderNo, lineNo),
+        process_id: normalizeProcessId(document.getElementById("tpiProcessId")?.value || "") || null,
+        process_text: getProcessText(document.getElementById("tpiProcessId")?.value || ""),
+        package_type: packageType,
+        print_side: document.getElementById("tpiPrintSide")?.value || "",
+        roll_direction: document.getElementById("tpiRollDirection")?.value || "",
+        print_material: getSelectedPrintMaterial(),
+        pitch: document.getElementById("tpiPitch")?.value || "",
+        line_width: lineWidth,
+        rows_across: rowsAcross,
+        total_width: calcTotalWidth(lineWidth, rowsAcross),
+        base_print_meters: Math.ceil(calcBasePrintMeters(packageType, qty, rowsAcross)),
+        print_waste_meters: calcPrintWaste(filesCount),
+        total_print_meters: calcTotalPrintMeters(packageType, qty, rowsAcross, filesCount),
+        graphic_file_key: graphicFileKey,
+        graphic_pdf_name: graphicFile ? graphicFile.name : (currentTpiEditingLineData?.graphic_pdf_name || ""),
+        graphic_pdf_path: graphicFile ? "" : (currentTpiEditingLineData?.graphic_pdf_path || ""),
+        graphic_pdf_url: graphicFile ? "" : (currentTpiEditingLineData?.graphic_pdf_url || ""),
+        source_order_line: window.currentTpiSourceOrderLine || currentTpiEditingLineData?.source_order_line || null
+      };
+      tpiLines.push(row);
+      currentTpiEditingLineData = null;
+      if (graphicInput) graphicInput.value = "";
+      document.getElementById("tpiMsg").innerText = graphicFile ? "שורה נוספה עם PDF גרפי" : "שורה נוספה";
+      drawTpiTables();
+      updateTpiPreview();
+    }
+
+    function removeTpiLine(index) {
+      const row = tpiLines[index];
+      if (row?.graphic_file_key) delete tpiLineGraphicFiles[row.graphic_file_key];
+      tpiLines.splice(index, 1);
+      drawTpiTables();
+    }
+    function removePrintFile(index) { tpiPrintFiles.splice(index, 1); drawTpiTables(); updateTpiPreview(); }
+
+    function editTpiLine(index) {
+      const r = tpiLines[index];
+      if (!r) return;
+      currentTpiEditingLineData = { ...r };
+      const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ""; };
+      set("tpiOrderNo", r.order_number || "");
+      set("tpiCustomer", r.customer_name || "");
+      set("tpiCustomerPo", r.customer_po || "");
+      set("tpiLineNo", r.order_line || "");
+      set("tpiSku", r.sku || "");
+      set("tpiProduct", r.product_name || "");
+      set("tpiQty", r.quantity || "");
+      set("tpiDueDate", r.due_date || "");
+      set("tpiProcessId", normalizeProcessId(r.process_id || ""));
+      set("tpiPackageType", r.package_type || "גליל");
+      set("tpiPrintSide", r.print_side || "");
+      set("tpiRollDirection", r.roll_direction || "");
+      const materialSelect = document.getElementById("tpiPrintMaterial");
+      const materialCustom = document.getElementById("tpiPrintMaterialCustom");
+      if (materialSelect) {
+        if ([...materialSelect.options].some(o => o.value === r.print_material)) materialSelect.value = r.print_material || "";
+        else { materialSelect.value = "אחר"; if (materialCustom) materialCustom.value = r.print_material || ""; }
+      }
+      toggleCustomPrintMaterial();
+      set("tpiPitch", r.pitch || "");
+      set("tpiLineWidth", r.line_width || "");
+      set("tpiRowsAcross", r.rows_across || "");
+      const fileInput = document.getElementById("tpiGraphicPdfFile");
+      if (fileInput) fileInput.value = "";
+      tpiLines.splice(index, 1);
+      drawTpiTables();
+      updateTpiPreview();
+      const msg = document.getElementById("tpiMsg");
+      if (msg) msg.innerText = "השורה נטענה לעריכה. אם רוצים להחליף PDF — בחר קובץ חדש ואז לחץ הוסף שורה לפק״ע.";
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    function editPrintFile(index) {
+      const f = tpiPrintFiles[index];
+      if (!f) return;
+      const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ""; };
+      set("printFileNo", f.file_no || "");
+      set("printFileName", f.file_name || "");
+      set("printFileComposition", f.composition_text || "");
+      set("printFileQuantity", f.print_quantity || "");
+      tpiPrintFiles.splice(index, 1);
+      drawTpiTables();
+      updateTpiPreview();
+      const msg = document.getElementById("tpiMsg");
+      if (msg) msg.innerText = "קובץ ההדפסה נטען לעריכה. שנה פרטים ולחץ הוסף קובץ.";
+    }
+
+    function addPrintFilePlan() {
+      const orderNo = getTpiOrderNo();
+      const rawFileNo = document.getElementById("printFileNo")?.value;
+      const fileNo = toNullableNumber(rawFileNo || (tpiPrintFiles.length + 1));
+      if (!fileNo) { document.getElementById("tpiMsg").innerText = "חובה להזין מספר קובץ תקין"; return; }
+      const fileName = document.getElementById("printFileName")?.value.trim() || `קובץ ${fileNo}`;
+      const printQuantity = toNullableNumber(document.getElementById("printFileQuantity")?.value);
+      const compositionText = document.getElementById("printFileComposition")?.value.trim();
+      if (!orderNo) { document.getElementById("tpiMsg").innerText = "חובה להזין מספר הזמנה לפני הוספת קובץ"; return; }
+      if (!compositionText) { document.getElementById("tpiMsg").innerText = "חובה להזין הרכב קובץ, לדוגמה 1+1+10+13"; return; }
+      if (!printQuantity) { document.getElementById("tpiMsg").innerText = "חובה להזין כמות להדפסה לכל קובץ"; return; }
+      const composition = parseFileComposition(compositionText);
+      if (!composition.length) { document.getElementById("tpiMsg").innerText = "מבנה הרכב קובץ לא תקין. השתמש בדוגמה 1+1+10+13"; return; }
+      const normalizedCompositionText = normalizeFileCompositionText(compositionText);
+      const qr_code = buildPrintFileQR(orderNo, fileNo);
+      tpiPrintFiles.push({ order_number: orderNo, file_no: fileNo, file_name: fileName, composition_text: normalizedCompositionText, composition, qr_code, print_quantity: printQuantity, status: "ממתין לדפוס" });
+      document.getElementById("printFileNo").value = fileNo + 1;
+      document.getElementById("printFileName").value = "";
+      document.getElementById("printFileComposition").value = "";
+      document.getElementById("printFileQuantity").value = "";
+      document.getElementById("tpiMsg").innerText = `קובץ הדפסה ${fileNo} נוסף בהצלחה`;
+      drawTpiTables();
+      updateTpiPreview();
+    }
+
+    function drawTpiTables() {
+      const linesEl = document.getElementById("tpiLinesTable");
+      if (linesEl) {
+        linesEl.innerHTML = !tpiLines.length ? `<p class="text-gray-400">עדיין לא נוספו שורות.</p>` : `
+          <table class="w-full text-sm border-collapse">
+            <thead><tr>${["פעולה","פק״ע","שורה","מק״ט","תיאור מוצר","כמות","חומר","PDF גרפי","רוחב כולל","מטרים לדפוס","תהליך"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead>
+            <tbody>${tpiLines.map((r,i) => `<tr>
+              <td class="border border-gray-700 p-2 whitespace-nowrap"><button onclick="editTpiLine(${i})" class="bg-blue-600 px-3 py-2 rounded-xl text-xs font-bold">ערוך</button> <button onclick="removeTpiLine(${i})" class="bg-red-600 px-3 py-2 rounded-xl text-xs font-bold">מחק</button></td>
+              <td class="border border-gray-700 p-2 ltr">${escapeHtml(r.work_order_no || displayWorkOrderNo(r.job_no))}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.order_line)}</td>
+              <td class="border border-gray-700 p-2 ltr">${escapeHtml(r.sku || "")}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.product_name)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.quantity)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.print_material)}</td>
+              <td class="border border-gray-700 p-2">${r.graphic_pdf_url ? `<a href="${escapeHtml(r.graphic_pdf_url)}" target="_blank" class="text-blue-300 underline">פתח PDF</a>` : escapeHtml(r.graphic_pdf_name || "לא צורף")}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.total_width)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.total_print_meters)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(r.process_text)}</td>
+            </tr>`).join("")}</tbody>
+          </table>`;
+      }
+      const filesEl = document.getElementById("printFilesTable");
+      if (filesEl) {
+        filesEl.innerHTML = !tpiPrintFiles.length ? `<p class="text-gray-400">עדיין לא נוספו קבצי הדפסה.</p>` : `
+          <table class="w-full text-sm border-collapse">
+            <thead><tr>${["פעולה","QR","מספר קובץ","שם קובץ","הרכב שורות","כמות להדפסה","סטטוס"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead>
+            <tbody>${tpiPrintFiles.map((f,i) => `<tr>
+              <td class="border border-gray-700 p-2 whitespace-nowrap"><button onclick="editPrintFile(${i})" class="bg-blue-600 px-3 py-2 rounded-xl text-xs font-bold">ערוך</button> <button onclick="removePrintFile(${i})" class="bg-red-600 px-3 py-2 rounded-xl text-xs font-bold">מחק</button></td>
+              <td class="border border-gray-700 p-2 ltr font-bold">${escapeHtml(f.qr_code)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(f.file_no)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(f.file_name)}</td>
+              <td class="border border-gray-700 p-2 ltr">${escapeHtml(f.composition_text)}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(f.print_quantity || "")}</td>
+              <td class="border border-gray-700 p-2">${escapeHtml(f.status || "ממתין לדפוס")}</td>
+            </tr>`).join("")}</tbody>
+          </table>`;
+      }
+      drawTpiQrLabels(false);
+    }
+
+    function drawTpiQrLabels(showAll = true) {
+      const container = document.getElementById("tpiQrLabels");
+      if (!container) return;
+      if (!tpiPrintFiles.length) { container.innerHTML = ""; return; }
+      container.innerHTML = tpiPrintFiles.map((f, i) => `
+        <div class="qr-label bg-white text-black rounded-2xl p-4 border border-gray-300 break-inside-avoid">
+          <div id="tpi_file_qr_${i}" class="flex justify-center mb-3 min-h-[130px]"></div>
+          <div class="text-sm font-bold">QR דפוס: ${escapeHtml(f.qr_code)}</div>
+          <div class="text-xs">הזמנה: ${escapeHtml(f.order_number)}</div>
+          <div class="text-xs">קובץ: ${escapeHtml(f.file_no)} — ${escapeHtml(f.file_name)}</div>
+          <div class="text-xs">שורות בקובץ: ${escapeHtml(f.composition_text)}</div>
+          <div class="text-xs font-bold">כמות להדפסה: ${escapeHtml(f.print_quantity || "")}</div>
+        </div>
+      `).join("");
+      tpiPrintFiles.forEach((f,i) => {
+        const el = document.getElementById(`tpi_file_qr_${i}`);
+        if (el) new QRCode(el, { text: f.qr_code, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.H });
+      });
+    }
+
+    function sanitizeStorageFileName(value) {
+      const original = String(value || "file.pdf").trim();
+      const extMatch = original.match(/\.([A-Za-z0-9]{1,8})$/);
+      const ext = extMatch ? "." + extMatch[1].toLowerCase() : "";
+      const base = ext ? original.slice(0, -ext.length) : original;
+      let safe = base
+        .normalize("NFKD")
+        .replace(/[\u0590-\u05FF]/g, "") // remove Hebrew chars from Storage key; original name is still saved separately
+        .replace(/[^A-Za-z0-9._-]+/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 80);
+      if (!safe) safe = "graphic_pdf";
+      return safe + (ext || ".pdf");
+    }
+
+    function buildPublicGraphicsUrl(filePath) {
+      const encodedPath = String(filePath || "").split("/").map(encodeURIComponent).join("/");
+      return `${SUPABASE_URL}/storage/v1/object/public/graphics/${encodedPath}`;
+    }
+
+    async function uploadGraphicPdfForTpiLine(row) {
+      const file = row?.graphic_file_key ? tpiLineGraphicFiles[row.graphic_file_key] : null;
+      if (!file) {
+        return {
+          graphic_pdf_name: row.graphic_pdf_name || "",
+          graphic_pdf_path: row.graphic_pdf_path || "",
+          graphic_pdf_url: row.graphic_pdf_url || ""
+        };
+      }
+
+      if (!(/\.pdf$/i.test(file.name) || file.type === "application/pdf")) {
+        throw new Error(`הקובץ ${file.name} אינו PDF`);
+      }
+
+      const orderPart = sanitizeStorageFileName(row.order_number || "order");
+      const jobPart = sanitizeStorageFileName(row.job_no || row.order_line || "line");
+      const fileName = `${Date.now()}-${sanitizeStorageFileName(file.name)}`;
+      const filePath = `${orderPart}/${jobPart}/${fileName}`;
+
+      const { error } = await client.storage.from("graphics").upload(filePath, file, {
+        cacheControl: "3600",
+        upsert: true,
+        contentType: "application/pdf"
+      });
+      if (error) throw new Error("שגיאה בהעלאת PDF גרפי. יש להריץ SQL של V34 ולוודא bucket בשם graphics. " + error.message);
+
+      return {
+        graphic_pdf_name: file.name,
+        graphic_pdf_path: filePath,
+        graphic_pdf_url: buildPublicGraphicsUrl(filePath)
+      };
+    }
+
+    async function saveTpiPrintPlan() {
+      const msg = document.getElementById("tpiMsg");
+      if (!tpiLines.length) { msg.innerText = "חובה להוסיף לפחות שורת הזמנה אחת"; return; }
+      if (!tpiPrintFiles.length) { msg.innerText = "חובה להוסיף לפחות קובץ הדפסה אחד"; return; }
+      const orderNo = getTpiOrderNo();
+      const orderPayload = {
+        order_number: orderNo,
+        work_order_no: buildTpiWorkOrderNo(orderNo),
+        customer_name: document.getElementById("tpiCustomer")?.value.trim() || "",
+        customer_po: document.getElementById("tpiCustomerPo")?.value.trim() || "",
+        order_date: document.getElementById("tpiOrderDate")?.value || null,
+        source: "order_lines_v34_4",
+        status: "פתוחה לדפוס",
+        planned_by: document.getElementById("tpiPlannedBy")?.value.trim() || currentEmployee?.name || "",
+        job_type: document.getElementById("tpiJobType")?.value || "",
+        approval_source: document.getElementById("tpiApprovalSource")?.value || "",
+        tpi_notes: document.getElementById("tpiNotes")?.value || "",
+        released_to_print_at: new Date().toISOString()
+      };
+      msg.innerText = "שומר נתוני תפ״י...";
+      const { error: orderError } = await client.from("tpi_orders").upsert(orderPayload, { onConflict: "order_number" });
+      if (orderError) { msg.innerText = "שגיאה בשמירת tpi_orders. יש להריץ SQL של V33: " + orderError.message; return; }
+
+      function nullIfBlankNumber(value) {
+        if (value === "" || value === null || value === undefined) return null;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      }
+      const uploadedTpiLines = [];
+      try {
+        for (const line of tpiLines) {
+          const graphicData = await uploadGraphicPdfForTpiLine(line);
+          uploadedTpiLines.push({ ...line, ...graphicData });
+        }
+      } catch (e) {
+        msg.innerText = e.message;
+        return;
+      }
+
+      if (currentTpiEditMode) {
+        await client.from("tpi_order_lines").delete().eq("order_number", orderNo);
+        await client.from("print_files").delete().eq("order_number", orderNo);
+      }
+
+      const lineJobNoCounts = {};
+      uploadedTpiLines.forEach(r => {
+        const key = String(r.job_no || "");
+        lineJobNoCounts[key] = (lineJobNoCounts[key] || 0) + 1;
+      });
+      const lineJobNoSeen = {};
+      const linesPayload = uploadedTpiLines.map(r => {
+        const baseJobNo = String(r.job_no || buildTpiJobNo(r.order_number, r.order_line));
+        lineJobNoSeen[baseJobNo] = (lineJobNoSeen[baseJobNo] || 0) + 1;
+        const uniqueJobNo = lineJobNoCounts[baseJobNo] > 1 ? `${baseJobNo}.${String(lineJobNoSeen[baseJobNo]).padStart(2, "0")}` : baseJobNo;
+        const { graphic_file_key, ...restRow } = r;
+        const dbRow = { ...restRow, job_no: uniqueJobNo };
+        return {
+          ...dbRow,
+          due_date: r.due_date || null,
+          process_id: r.process_id === "" || r.process_id === undefined ? null : r.process_id,
+          pitch: nullIfBlankNumber(r.pitch),
+          line_width: nullIfBlankNumber(r.line_width),
+          rows_across: nullIfBlankNumber(r.rows_across),
+          total_width: nullIfBlankNumber(r.total_width),
+          base_print_meters: nullIfBlankNumber(r.base_print_meters),
+          print_waste_meters: nullIfBlankNumber(r.print_waste_meters),
+          total_print_meters: nullIfBlankNumber(r.total_print_meters),
+          raw_data: { ...dbRow }
+        };
+      });
+      const { error: linesError } = await client.from("tpi_order_lines").upsert(linesPayload, { onConflict: "job_no" });
+      if (linesError) { msg.innerText = "שגיאה בשמירת tpi_order_lines. יש להריץ SQL של V34: " + linesError.message; return; }
+      tpiLines = uploadedTpiLines.map(r => ({ ...r, graphic_file_key: "" }));
+      tpiLineGraphicFiles = {};
+      drawTpiTables();
+
+      const filesPayload = tpiPrintFiles.map(f => ({
+        order_number: f.order_number,
+        qr_code: f.qr_code,
+        file_no: toNullableNumber(f.file_no),
+        file_name: f.file_name,
+        composition_text: f.composition_text,
+        composition: f.composition,
+        print_quantity: toNullableNumber(f.print_quantity),
+        status: f.status || "ממתין לדפוס"
+      }));
+      const { error: filesError } = await client.from("print_files").upsert(filesPayload, { onConflict: "qr_code" });
+      if (filesError) { msg.innerText = "שגיאה בשמירת print_files. יש להריץ SQL של V33: " + filesError.message; return; }
+
+      currentTpiEditMode = false;
+      currentTpiEditOrderNo = "";
+      msg.innerHTML = `
+        <div class="bg-green-900/40 border border-green-700 rounded-2xl p-4">
+          <div class="font-bold text-green-200 mb-3">נשמר בהצלחה: ${tpiLines.length} שורות ו-${tpiPrintFiles.length} קבצי הדפסה</div>
+          <div class="grid md:grid-cols-3 gap-3">
+            <button onclick="renderTpiOrderDetails('${escapeHtml(orderNo)}')" class="bg-blue-600 p-3 rounded-xl font-bold">צפייה בפק״ע</button>
+            <button onclick="renderTpiWorkOrders('open')" class="bg-purple-600 p-3 rounded-xl font-bold">פק״עות פתוחות</button>
+            <button onclick="renderNewTpiPrintPlanner()" class="bg-gray-700 p-3 rounded-xl font-bold">פק״ע חדשה</button>
+          </div>
+        </div>`;
+      drawTpiQrLabels(true);
+    }
+
+    function printTpiFileQrLabels() {
+      drawTpiQrLabels(true);
+      setTimeout(() => window.print(), 300);
+    }
+
+    async function findPrintFileByQR(qrCode) {
+      const { data, error } = await client.from("print_files").select("*").eq("qr_code", qrCode).maybeSingle();
+      if (error) { console.error(error); return null; }
+      if (!data) return null;
+      const { data: lines } = await client.from("tpi_order_lines").select("*").eq("order_number", data.order_number);
+      return { ...data, lines: lines || [] };
+    }
+
+    function renderPrintWorkStart() {
+      page(`
+        ${topBar("דפוס — פתיחת עבודה", `עובד: ${currentEmployee.name}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <h2 class="text-xl font-bold">סריקת QR קובץ הדפסה</h2>
+          <p class="text-gray-400 text-sm">בשלב זה אפשר להקליד ידנית את QR הדפוס, לדוגמה: <span class="ltr">0741.26.F01</span></p>
+          <div class="grid md:grid-cols-[1fr_auto] gap-3">
+            <input id="manualPrintQr" class="p-4 rounded-2xl bg-gray-800 border border-gray-700 ltr" placeholder="QR קובץ הדפסה">
+            <button onclick="loadPrintFileManual()" class="bg-pink-700 p-4 rounded-2xl font-bold">טען קובץ</button>
+          </div>
+          <div id="printFileInfo"></div>
+          <button onclick="renderStartForm()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור ללמינציה</button>
+          <p id="printStartMsg" class="text-yellow-300"></p>
+        </section>
+      `);
+    }
+
+    async function loadPrintFileManual() {
+      const qr = document.getElementById("manualPrintQr")?.value.trim();
+      const msg = document.getElementById("printStartMsg");
+      if (!qr) { msg.innerText = "הקלד QR קובץ הדפסה"; return; }
+      msg.innerText = "טוען קובץ הדפסה...";
+      const found = await findPrintFileByQR(qr);
+      if (!found) { msg.innerText = "לא נמצא קובץ הדפסה. ודא שהתפ״י נשמר ושה-QR נכון."; return; }
+      currentPrintFileData = found;
+      msg.innerText = "";
+      renderPrintFileInfo();
+    }
+
+    function renderPrintFileInfo() {
+      const el = document.getElementById("printFileInfo");
+      if (!el || !currentPrintFileData) return;
+      const f = currentPrintFileData;
+      const lineMap = new Map((f.lines || []).map(l => [String(l.order_line), l]));
+      const composition = Array.isArray(f.composition) ? f.composition : parseFileComposition(f.composition_text);
+      el.innerHTML = `
+        <div class="bg-blue-900/30 border border-blue-700 rounded-2xl p-4 space-y-2">
+          <div class="font-bold text-blue-200">קובץ הדפסה נטען</div>
+          <div>QR: <span class="ltr font-bold">${escapeHtml(f.qr_code)}</span></div>
+          <div>הזמנה: ${escapeHtml(f.order_number)}</div>
+          <div>קובץ: ${escapeHtml(f.file_no)} — ${escapeHtml(f.file_name)}</div>
+          <div>הרכב: <span class="ltr">${escapeHtml(f.composition_text)}</span></div>
+          <table class="w-full text-sm border-collapse mt-3">
+            <thead><tr>${["שורה בקובץ","מוצר","חומר","רוחב כולל","מטרים לדפוס","כיוון"].map(h => `<th class="border border-blue-700 p-2 bg-blue-950/60">${h}</th>`).join("")}</tr></thead>
+            <tbody>${composition.map(c => {
+              const l = lineMap.get(String(c.line)) || {};
+              return `<tr><td class="border border-blue-700 p-2">${escapeHtml(c.line)}</td><td class="border border-blue-700 p-2">${escapeHtml(l.product_name || "")}</td><td class="border border-blue-700 p-2">${escapeHtml(l.print_material || "")}</td><td class="border border-blue-700 p-2">${escapeHtml(l.total_width || "")}</td><td class="border border-blue-700 p-2">${escapeHtml(l.total_print_meters || "")}</td><td class="border border-blue-700 p-2">${escapeHtml(l.roll_direction || "")}</td></tr>`;
+            }).join("")}</tbody>
+          </table>
+        </div>
+        <button onclick="renderPrintQualityForm()" class="w-full bg-green-600 p-4 rounded-2xl font-bold mt-4">המשך לבקרת איכות דפוס</button>`;
+    }
+
+    function renderPrintQualityForm() {
+      if (!currentPrintFileData) { alert("יש לטעון קובץ דפוס קודם"); return; }
+      page(`
+        ${topBar("בקרת איכות דפוס", `QR: ${currentPrintFileData.qr_code}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <div class="bg-blue-900/30 border border-blue-700 rounded-2xl p-4">
+            <div>הזמנה: ${escapeHtml(currentPrintFileData.order_number)}</div>
+            <div>קובץ: ${escapeHtml(currentPrintFileData.file_no)} — ${escapeHtml(currentPrintFileData.file_name)}</div>
+            <div>הרכב שורות: <span class="ltr">${escapeHtml(currentPrintFileData.composition_text)}</span></div>
+          </div>
+          ${fieldSelect("pq_material_match", "התאמת חומר להוראות תפ״י", ["כן", "לא"])}
+          ${fieldSelect("pq_pdf_match", "התאמת PDF / קובץ הדפסה", ["כן", "לא"])}
+          ${fieldNumber("pq_width", "רוחב בפועל")}
+          ${fieldNumber("pq_pitch", "פסיעה בפועל")}
+          ${fieldSelect("pq_print_side", "פנימי / חיצוני", PRINT_SIDES)}
+          ${fieldSelect("pq_roll_direction", "כיוון גלגול", ROLL_DIRECTIONS)}
+          ${fieldSelect("pq_print_cleanliness", "ניקיון הדפסה", ["תקין", "לא תקין"])}
+          <div>
+            <label class="block mb-2">קריאת ברקוד / QR מהמוצר</label>
+            <input id="pq_barcode_value" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="הקלד/סרוק ערך ברקוד אם קיים">
+          </div>
+          <label class="block">הערות</label>
+          <textarea id="pq_comments" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></textarea>
+          <button onclick="startPrintJobWithQuality()" class="w-full bg-green-600 p-5 rounded-3xl text-xl font-bold">אשר איכות והתחל דפוס</button>
+          <button onclick="renderPrintWorkStart()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור</button>
+          <p id="printQualityMsg" class="text-yellow-300"></p>
+        </section>
+      `);
+    }
+
+    function getPrintQualityPayload(jobId) {
+      const required = ["pq_material_match", "pq_pdf_match", "pq_width", "pq_pitch", "pq_print_side", "pq_roll_direction", "pq_print_cleanliness"];
+      for (const id of required) if (!document.getElementById(id).value) throw new Error("יש למלא את כל שדות בקרת האיכות בדפוס");
+      return {
+        job_id: jobId,
+        print_file_qr: currentPrintFileData?.qr_code || "",
+        order_number: currentPrintFileData?.order_number || "",
+        file_no: toNullableNumber(currentPrintFileData?.file_no),
+        material_match: document.getElementById("pq_material_match").value === "כן",
+        pdf_match: document.getElementById("pq_pdf_match").value === "כן",
+        width: Number(document.getElementById("pq_width").value),
+        pitch: Number(document.getElementById("pq_pitch").value),
+        print_side: document.getElementById("pq_print_side").value,
+        roll_direction: document.getElementById("pq_roll_direction").value,
+        print_cleanliness: document.getElementById("pq_print_cleanliness").value,
+        barcode_value: document.getElementById("pq_barcode_value").value,
+        comments: document.getElementById("pq_comments").value,
+        approved: true
+      };
+    }
+
+    async function startPrintJobWithQuality() {
+      const msg = document.getElementById("printQualityMsg");
+      let q;
+      try { q = getPrintQualityPayload(null); } catch (e) { msg.innerText = e.message; return; }
+      const { data: job, error } = await client.from("jobs").insert({
+        order_number: currentPrintFileData.order_number,
+        employee_id: currentEmployee.id,
+        batch_number: currentPrintFileData.qr_code,
+        start_time: new Date().toISOString(),
+        status: "open",
+        department: "דפוס"
+      }).select().single();
+      if (error) { msg.innerText = "שגיאה ביצירת עבודת דפוס: " + error.message; return; }
+      currentPrintJob = job;
+      q.job_id = job.id;
+      const { error: qError } = await client.from("print_quality").insert(q);
+      if (qError) { msg.innerText = "שגיאה בשמירת בקרת איכות דפוס. יש להריץ SQL של V33: " + qError.message; return; }
+      renderActivePrintJob();
+    }
+
+    function renderActivePrintJob() {
+      page(`
+        ${topBar("דפוס פעיל", `קובץ: ${currentPrintFileData?.qr_code || ""}`)}
+        <section class="grid gap-4">
+          <div class="bg-green-900/40 border border-green-700 rounded-3xl p-5">
+            <h2 class="text-xl font-bold">עבודת דפוס פעילה</h2>
+            <p class="text-gray-300 mt-2">שעת התחלה: ${new Date(currentPrintJob.start_time).toLocaleTimeString("he-IL")}</p>
+            <p class="text-gray-300 mt-2">קובץ: ${escapeHtml(currentPrintFileData?.file_name || "")}</p>
+          </div>
+          <button onclick="renderFinishPrintJob()" class="w-full bg-orange-500 p-5 rounded-3xl text-xl font-bold">סיום דפוס</button>
+        </section>`);
+    }
+
+    function renderFinishPrintJob() {
+      page(`
+        ${topBar("סיום דפוס", `QR: ${currentPrintJob.batch_number}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <div><label class="block mb-2">מטרים שהודפסו בפועל</label><input id="printMetersDone" type="number" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></div>
+          <label class="block">הערות סיום</label><textarea id="printFinishComments" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700"></textarea>
+          <button onclick="finishPrintJob()" class="w-full bg-green-600 p-5 rounded-3xl text-xl font-bold">סיים ושמור דפוס</button>
+          <button onclick="renderActivePrintJob()" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">חזור</button>
+          <p id="finishPrintMsg" class="text-yellow-300"></p>
+        </section>`);
+    }
+
+    async function finishPrintJob() {
+      const meters = document.getElementById("printMetersDone")?.value;
+      if (!meters) { document.getElementById("finishPrintMsg").innerText = "חובה להזין מטרים שהודפסו"; return; }
+      const { error } = await client.from("jobs").update({
+        end_time: new Date().toISOString(),
+        status: "closed",
+        transfer_meters: Number(meters),
+        finish_comments: document.getElementById("printFinishComments")?.value || ""
+      }).eq("id", currentPrintJob.id);
+      if (error) { document.getElementById("finishPrintMsg").innerText = "שגיאה בסגירת דפוס: " + error.message; return; }
+      page(`
+        <main class="min-h-screen flex items-center justify-center p-4">
+          <section class="bg-gray-900 border border-gray-800 rounded-3xl p-8 text-center max-w-md">
+            <h1 class="text-3xl font-bold text-green-400 mb-4">עבודת הדפוס נסגרה בהצלחה</h1>
+            <button onclick="renderPrintWorkStart()" class="w-full bg-pink-700 p-4 rounded-2xl font-bold">פתח עבודת דפוס חדשה</button>
+          </section>
+        </main>`);
+    }
+
+
+
+    // ===============================
+    // V34.3 — TPI WORK ORDERS LIST / VIEW / PRINT / EXCEL
+    // ===============================
+
+    let tpiWorkOrdersCache = [];
+
+    function isClosedTpiStatus(status) {
+      const s = String(status || "").trim();
+      return s === "סגורה" || s === "בוטלה" || s.toLowerCase() === "closed" || s.toLowerCase() === "cancelled";
+    }
+
+    function formatDateTimeHe(value) {
+      if (!value) return "";
+      try { return new Date(value).toLocaleString("he-IL"); } catch(e) { return String(value || ""); }
+    }
+
+    function summarizeTpiOrder(order, lines, files) {
+      const orderLines = (lines || []).filter(l => String(l.order_number) === String(order.order_number));
+      const orderFiles = (files || []).filter(f => String(f.order_number) === String(order.order_number));
+      const firstLine = orderLines[0] || {};
+      const uniq = arr => [...new Set(arr.map(x => String(x || "").trim()).filter(Boolean))];
+      const materials = uniq(orderLines.map(l => l.print_material)).join(" / ");
+      const packageTypes = uniq(orderLines.map(l => l.package_type)).join(" / ");
+      const filesMeters = orderFiles.reduce((sum, f) => sum + (Number(f.print_quantity) || 0), 0);
+      const totalMeters = filesMeters || orderLines.reduce((sum, l) => sum + (Number(l.total_print_meters) || 0), 0);
+      const totalWidth = Math.max(0, ...orderLines.map(l => Number(l.total_width) || 0));
+      const rowsAcross = uniq(orderLines.map(l => l.rows_across)).join(" / ");
+      return {
+        ...order,
+        job_no_display: order.work_order_no || firstLine.work_order_no || displayWorkOrderNo(firstLine.job_no || order.order_number || ""),
+        package_type_display: packageTypes,
+        material_display: materials,
+        total_print_meters_display: totalMeters || "",
+        total_width_display: totalWidth || "",
+        rows_across_display: rowsAcross,
+        print_files_count: orderFiles.length,
+        lines: orderLines,
+        files: orderFiles
+      };
+    }
+
+    async function fetchTpiWorkOrders(mode = "open") {
+      const { data: orders, error: ordersError } = await client
+        .from("tpi_orders")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(500);
+      if (ordersError) throw ordersError;
+
+      const orderNumbers = (orders || []).map(o => o.order_number).filter(Boolean);
+      let lines = [];
+      let files = [];
+      if (orderNumbers.length) {
+        const { data: linesData, error: linesError } = await client.from("tpi_order_lines").select("*").in("order_number", orderNumbers);
+        if (linesError) throw linesError;
+        lines = linesData || [];
+        const { data: filesData, error: filesError } = await client.from("print_files").select("*").in("order_number", orderNumbers);
+        if (filesError) throw filesError;
+        files = filesData || [];
+      }
+
+      const summarized = (orders || []).map(o => summarizeTpiOrder(o, lines, files));
+      return summarized.filter(o => mode === "closed" ? isClosedTpiStatus(o.status) : !isClosedTpiStatus(o.status));
+    }
+
+    async function renderTpiWorkOrders(mode = "open") {
+      page(`
+        ${topBar(mode === "closed" ? "פק״עות סגורות" : "פק״עות פתוחות", `מנהל: ${currentEmployee.name}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <div class="flex flex-wrap gap-3 justify-between items-center">
+            <div>
+              <h2 class="text-xl font-bold">${mode === "closed" ? "פק״עות סגורות" : "פק״עות פתוחות לדפוס"}</h2>
+              <p class="text-gray-400 text-sm">רשימת הפק״עות שנוצרו בתפ״י. מכאן אפשר לצפות, להדפיס ולייצא לתכנון דפוס.</p>
+            </div>
+            <div class="flex gap-2 flex-wrap">
+              <button onclick="renderNewTpiPrintPlanner()" class="bg-pink-700 px-4 py-3 rounded-2xl font-bold">פק״ע חדשה</button>
+              <button onclick="renderTpiWorkOrders('${mode}')" class="bg-blue-600 px-4 py-3 rounded-2xl font-bold">רענן</button>
+              ${mode === "open" ? `<button onclick="exportTpiOpenOrdersExcel()" class="bg-green-600 px-4 py-3 rounded-2xl font-bold">הורד Excel</button>` : ""}
+              <button onclick="renderManager()" class="bg-gray-700 px-4 py-3 rounded-2xl font-bold">חזור</button>
+            </div>
+          </div>
+          <div id="tpiWorkOrdersMsg" class="text-yellow-300">טוען...</div>
+          <div id="tpiWorkOrdersTable" class="overflow-auto"></div>
+        </section>
+      `);
+
+      try {
+        tpiWorkOrdersCache = await fetchTpiWorkOrders(mode);
+        drawTpiWorkOrdersTable(tpiWorkOrdersCache, mode);
+      } catch (e) {
+        document.getElementById("tpiWorkOrdersMsg").innerText = "שגיאה בטעינת פק״עות. יש להריץ SQL של V34.3: " + e.message;
+      }
+    }
+
+    function drawTpiWorkOrdersTable(rows, mode = "open") {
+      const msg = document.getElementById("tpiWorkOrdersMsg");
+      const el = document.getElementById("tpiWorkOrdersTable");
+      if (!el) return;
+      if (msg) msg.innerText = rows.length ? `נמצאו ${rows.length} פק״עות` : "לא נמצאו פק״עות";
+      if (!rows.length) { el.innerHTML = `<p class="text-gray-400">אין נתונים להצגה.</p>`; return; }
+
+      const openHeaders = ["פעולות", "פק״ע", "לקוח", "סוג אריזה", "חומר הדפסה", "כמות להדפסה", "רוחב כולל", "מספר שורות", "מספר קבצים", "מתכנן", "סטטוס"];
+      const closedHeaders = ["פעולות", "פק״ע", "לקוח", "חומר", "כמות", "תאריך סגירה", "נסגר ע״י"];
+      const headers = mode === "closed" ? closedHeaders : openHeaders;
+      el.innerHTML = `
+        <table class="w-full text-sm border-collapse">
+          <thead><tr>${headers.map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead>
+          <tbody>${rows.map(r => mode === "closed" ? `
+            <tr>
+              <td class="border border-gray-700 p-2 whitespace-nowrap"><button onclick="renderTpiOrderDetails('${escapeHtml(r.order_number)}')" class="bg-blue-600 px-3 py-2 rounded-xl text-xs font-bold">צפייה</button></td>
+              <td class="border border-gray-700 p-2 ltr whitespace-nowrap">${escapeHtml(r.job_no_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.customer_name)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.material_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.total_print_meters_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(formatDateTimeHe(r.closed_at))}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.closed_by || "")}</td>
+            </tr>` : `
+            <tr>
+              <td class="border border-gray-700 p-2 whitespace-nowrap flex gap-2">
+                <button onclick="renderTpiOrderDetails('${escapeHtml(r.order_number)}')" class="bg-blue-600 px-3 py-2 rounded-xl text-xs font-bold">צפייה</button>
+                <button onclick="renderEditTpiOrder('${escapeHtml(r.order_number)}')" class="bg-purple-600 px-3 py-2 rounded-xl text-xs font-bold">עריכה</button>
+                <button onclick="printTpiWorkOrder('${escapeHtml(r.order_number)}')" class="bg-green-600 px-3 py-2 rounded-xl text-xs font-bold">הדפסה</button>
+              </td>
+              <td class="border border-gray-700 p-2 ltr whitespace-nowrap">${escapeHtml(r.job_no_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.customer_name)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.package_type_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.material_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.total_print_meters_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.total_width_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.rows_across_display)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.print_files_count)}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.planned_by || "")}</td>
+              <td class="border border-gray-700 p-2 whitespace-nowrap">${escapeHtml(r.status || "")}</td>
+            </tr>`).join("")}</tbody>
+        </table>`;
+    }
+
+    async function getFullTpiOrder(orderNumber) {
+      const { data: order, error: orderError } = await client.from("tpi_orders").select("*").eq("order_number", orderNumber).maybeSingle();
+      if (orderError) throw orderError;
+      const { data: lines, error: linesError } = await client.from("tpi_order_lines").select("*").eq("order_number", orderNumber).order("order_line", { ascending: true });
+      if (linesError) throw linesError;
+      const { data: files, error: filesError } = await client.from("print_files").select("*").eq("order_number", orderNumber).order("file_no", { ascending: true });
+      if (filesError) throw filesError;
+      return summarizeTpiOrder(order || { order_number: orderNumber }, lines || [], files || []);
+    }
+
+
+    async function renderEditTpiOrder(orderNumber) {
+      try {
+        const o = await getFullTpiOrder(orderNumber);
+        if (isClosedTpiStatus(o.status) || String(o.status || "").trim() === "בדפוס") {
+          alert("לא ניתן לערוך פק״ע בסטטוס " + (o.status || "") + ". עריכה מלאה אפשרית רק בפק״ע פתוחה לדפוס.");
+          return;
+        }
+        currentTpiEditMode = true;
+        currentTpiEditOrderNo = orderNumber;
+        tpiLines = (o.lines || []).map(l => ({ ...l, graphic_file_key: "" }));
+        tpiLineGraphicFiles = {};
+        tpiPrintFiles = (o.files || []).map(f => ({
+          order_number: f.order_number,
+          qr_code: f.qr_code,
+          file_no: f.file_no,
+          file_name: f.file_name,
+          composition_text: f.composition_text || "",
+          composition: Array.isArray(f.composition) ? f.composition : parseFileComposition(f.composition_text || ""),
+          print_quantity: f.print_quantity || "",
+          status: f.status || "ממתין לדפוס"
+        }));
+        renderTpiPrintPlanner();
+        setTimeout(() => {
+          const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value ?? ""; };
+          set("tpiOrderNo", o.order_number || "");
+          set("tpiCustomer", o.customer_name || "");
+          set("tpiCustomerPo", o.customer_po || "");
+          set("tpiOrderDate", o.order_date || new Date().toISOString().slice(0,10));
+          set("tpiPlannedBy", o.planned_by || currentEmployee?.name || "");
+          set("tpiJobType", o.job_type || "עבודה חדשה");
+          set("tpiApprovalSource", o.approval_source || "מנהל");
+          set("tpiStatus", o.status || "פתוחה לדפוס");
+          set("tpiNotes", o.tpi_notes || "");
+          drawTpiTables();
+          updateTpiPreview();
+          const msg = document.getElementById("tpiMsg");
+          if (msg) msg.innerText = "מצב עריכה: אפשר לשנות שורות, להחליף PDF, לבנות קבצי דפוס ולשמור מחדש.";
+        }, 100);
+      } catch (e) {
+        alert("שגיאה בטעינת פק״ע לעריכה: " + e.message);
+      }
+    }
+
+    async function renderTpiOrderDetails(orderNumber) {
+      page(`
+        ${topBar("צפייה בפק״ע", `הזמנה: ${orderNumber}`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 space-y-4">
+          <div class="flex gap-2 flex-wrap">
+            <button onclick="renderTpiWorkOrders('open')" class="bg-gray-700 px-4 py-3 rounded-2xl font-bold">פק״עות פתוחות</button>
+            <button onclick="renderEditTpiOrder('${escapeHtml(orderNumber)}')" class="bg-purple-600 px-4 py-3 rounded-2xl font-bold">עריכת פק״ע</button>
+            <button onclick="printTpiWorkOrder('${escapeHtml(orderNumber)}')" class="bg-green-600 px-4 py-3 rounded-2xl font-bold">הדפס פק״ע</button>
+            <button onclick="renderManager()" class="bg-gray-700 px-4 py-3 rounded-2xl font-bold">חזור למנהל</button>
+          </div>
+          <div id="tpiOrderDetailsBox" class="text-gray-300">טוען...</div>
+        </section>
+      `);
+      try {
+        const order = await getFullTpiOrder(orderNumber);
+        drawTpiOrderDetails(order);
+      } catch (e) {
+        document.getElementById("tpiOrderDetailsBox").innerHTML = `<p class="text-red-400">שגיאה בטעינת פק״ע: ${escapeHtml(e.message)}</p>`;
+      }
+    }
+
+    function drawTpiOrderDetails(o) {
+      const el = document.getElementById("tpiOrderDetailsBox");
+      if (!el) return;
+      el.innerHTML = `
+        <div class="grid md:grid-cols-3 gap-3">
+          <div class="bg-gray-800/60 border border-gray-700 rounded-2xl p-4"><div class="text-gray-400 text-sm">פק״ע</div><div class="font-bold text-xl ltr">${escapeHtml(o.job_no_display)}</div></div>
+          <div class="bg-gray-800/60 border border-gray-700 rounded-2xl p-4"><div class="text-gray-400 text-sm">לקוח</div><div class="font-bold text-xl">${escapeHtml(o.customer_name)}</div></div>
+          <div class="bg-gray-800/60 border border-gray-700 rounded-2xl p-4"><div class="text-gray-400 text-sm">סטטוס</div><div class="font-bold text-xl">${escapeHtml(o.status || "")}</div></div>
+        </div>
+        <div class="bg-gray-800/40 border border-gray-700 rounded-2xl p-4 mt-4 grid md:grid-cols-4 gap-3 text-sm">
+          <div><b>מתכנן:</b> ${escapeHtml(o.planned_by || "")}</div>
+          <div><b>סוג עבודה:</b> ${escapeHtml(o.job_type || "")}</div>
+          <div><b>גורם מאשר:</b> ${escapeHtml(o.approval_source || "")}</div>
+          <div><b>שחרור לדפוס:</b> ${escapeHtml(formatDateTimeHe(o.released_to_print_at))}</div>
+          <div class="md:col-span-4"><b>הערות תפ״י:</b> ${escapeHtml(o.tpi_notes || "")}</div>
+        </div>
+        <h3 class="text-xl font-bold mt-5 mb-3">שורות פק״ע</h3>
+        <div class="overflow-auto">${renderTpiLinesMiniTable(o.lines || [])}</div>
+        <h3 class="text-xl font-bold mt-5 mb-3">קבצי הדפסה</h3>
+        <div class="overflow-auto">${renderPrintFilesMiniTable(o.files || [])}</div>`;
+      setTimeout(() => drawInlineFileQrs(o.files || []), 100);
+    }
+
+    function renderTpiLinesMiniTable(lines) {
+      if (!lines.length) return `<p class="text-gray-400">אין שורות.</p>`;
+      return `<table class="w-full text-sm border-collapse"><thead><tr>${["שורה","מק״ט","תיאור מוצר","חומר","כמות להדפסה","רוחב כולל","מספר שורות","PDF גרפי"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead><tbody>${lines.map(l => `<tr>
+        <td class="border border-gray-700 p-2">${escapeHtml(l.order_line)}</td>
+        <td class="border border-gray-700 p-2 ltr">${escapeHtml(l.sku || "")}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(l.product_name)}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(l.print_material)}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(l.total_print_meters)}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(l.total_width)}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(l.rows_across)}</td>
+        <td class="border border-gray-700 p-2">${l.graphic_pdf_url ? `<a href="${escapeHtml(l.graphic_pdf_url)}" target="_blank" class="text-blue-300 underline">פתח PDF</a>` : "לא צורף"}</td>
+      </tr>`).join("")}</tbody></table>`;
+    }
+
+    function renderPrintFilesMiniTable(files) {
+      if (!files.length) return `<p class="text-gray-400">אין קבצי הדפסה.</p>`;
+      return `<table class="w-full text-sm border-collapse"><thead><tr>${["קובץ","שם קובץ","הרכב שורות","כמות להדפסה","סטטוס","QR"].map(h => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${h}</th>`).join("")}</tr></thead><tbody>${files.map((f,i) => `<tr>
+        <td class="border border-gray-700 p-2">${escapeHtml(f.file_no)}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(f.file_name)}</td>
+        <td class="border border-gray-700 p-2 ltr">${escapeHtml(f.composition_text)}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(f.print_quantity || "")}</td>
+        <td class="border border-gray-700 p-2">${escapeHtml(f.status || "")}</td>
+        <td class="border border-gray-700 p-2"><div id="detail_qr_${i}" class="inline-block bg-white p-2 rounded"></div><div class="ltr text-xs mt-1">${escapeHtml(f.qr_code)}</div></td>
+      </tr>`).join("")}</tbody></table>`;
+    }
+
+    function drawInlineFileQrs(files) {
+      (files || []).forEach((f,i) => {
+        const el = document.getElementById(`detail_qr_${i}`);
+        if (el && window.QRCode) new QRCode(el, { text: f.qr_code || "", width: 90, height: 90, correctLevel: QRCode.CorrectLevel.H });
+      });
+    }
+
+    async function printTpiWorkOrder(orderNumber) {
+      try {
+        const o = await getFullTpiOrder(orderNumber);
+        openTpiWorkOrderPrint(o);
+      } catch (e) {
+        alert("שגיאה בהדפסת פק״ע: " + e.message);
+      }
+    }
+
+    function openTpiWorkOrderPrint(o) {
+      const win = window.open("", "_blank", "width=1100,height=800");
+      if (!win) { alert("הדפדפן חסם חלון הדפסה"); return; }
+      const files = o.files || [];
+      const lines = o.lines || [];
+      win.document.open();
+      win.document.write(`<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="UTF-8"><title>פק״ע ${escapeHtml(o.job_no_display)}</title><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"><\/script><style>
+        @page{size:A4;margin:10mm} body{font-family:Arial,sans-serif;color:#111;direction:rtl} .head{display:flex;justify-content:space-between;border-bottom:3px solid #111;padding-bottom:8px;margin-bottom:12px}.logo{font-size:24px;font-weight:900}.meta{font-size:12px;direction:ltr}.box{border:1.5px solid #111;border-radius:10px;padding:10px;margin:10px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.item{border:1px solid #ccc;border-radius:8px;padding:8px}.lbl{font-size:11px;color:#555}.val{font-size:16px;font-weight:800}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border:1px solid #555;padding:6px;text-align:center}th{background:#eee}.qrrow{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.qrcard{border:1.5px solid #111;border-radius:10px;padding:10px;text-align:center;break-inside:avoid}.ltr{direction:ltr;unicode-bidi:embed}.notes{white-space:pre-wrap;min-height:35px}@media print{button{display:none}}
+      </style></head><body>
+        <div class="head"><div><div class="logo">DIGIPACK SMART FLOOR</div><div>פקודת עבודה לדפוס</div></div><div class="meta">${escapeHtml(new Date().toLocaleString("he-IL"))}</div></div>
+        <div class="box grid">
+          <div class="item"><div class="lbl">פק״ע</div><div class="val ltr">${escapeHtml(o.job_no_display)}</div></div>
+          <div class="item"><div class="lbl">לקוח</div><div class="val">${escapeHtml(o.customer_name)}</div></div>
+          <div class="item"><div class="lbl">סטטוס</div><div class="val">${escapeHtml(o.status || "")}</div></div>
+          <div class="item"><div class="lbl">מתכנן</div><div class="val">${escapeHtml(o.planned_by || "")}</div></div>
+          <div class="item"><div class="lbl">סוג עבודה</div><div class="val">${escapeHtml(o.job_type || "")}</div></div>
+          <div class="item"><div class="lbl">גורם מאשר</div><div class="val">${escapeHtml(o.approval_source || "")}</div></div>
+        </div>
+        <div class="box"><b>הערות תפ״י</b><div class="notes">${escapeHtml(o.tpi_notes || "")}</div></div>
+        <div class="box"><h3>שורות פק״ע</h3>${renderTpiLinesMiniTable(lines).replaceAll('text-blue-300 underline','')}</div>
+        <div class="box"><h3>קבצי הדפסה ו-QR</h3><div class="qrrow">${files.map((f,i) => `<div class="qrcard"><div id="print_qr_${i}"></div><h3>קובץ ${escapeHtml(f.file_no)} — ${escapeHtml(f.file_name)}</h3><div class="ltr">${escapeHtml(f.qr_code)}</div><div>הרכב שורות: <span class="ltr">${escapeHtml(f.composition_text)}</span></div><div><b>כמות להדפסה:</b> ${escapeHtml(f.print_quantity || "")}</div><div><b>סטטוס:</b> ${escapeHtml(f.status || "")}</div></div>`).join("")}</div></div>
+        <button onclick="window.print()">הדפס</button>
+        <script>const files=${JSON.stringify(files)}; window.onload=function(){files.forEach(function(f,i){var el=document.getElementById('print_qr_'+i); if(el) new QRCode(el,{text:f.qr_code||'',width:150,height:150,correctLevel:QRCode.CorrectLevel.H});}); setTimeout(function(){window.print();},600);};<\/script>
+      </body></html>`);
+      win.document.close();
+    }
+
+    async function exportTpiOpenOrdersExcel() {
+      try {
+        const rows = await fetchTpiWorkOrders("open");
+        if (!rows.length) { alert("אין פק״עות פתוחות לייצוא"); return; }
+        const excelRows = rows.map(r => ({
+          "פק״ע": r.job_no_display || "",
+          "לקוח": r.customer_name || "",
+          "סוג אריזה": r.package_type_display || "",
+          "חומר הדפסה": r.material_display || "",
+          "כמות להדפסה": r.total_print_meters_display || "",
+          "רוחב כולל": r.total_width_display || "",
+          "מספר שורות": r.rows_across_display || "",
+          "מספר קבצים": r.print_files_count || 0,
+          "סטטוס": r.status || ""
+        }));
+        const ws = XLSX.utils.json_to_sheet(excelRows);
+        ws["!cols"] = Object.keys(excelRows[0]).map(() => ({ wch: 18 }));
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "פקעות פתוחות");
+        const today = new Date().toISOString().slice(0,10);
+        XLSX.writeFile(wb, `digipack-open-tpi-orders-${today}.xlsx`);
+      } catch (e) {
+        alert("שגיאה ביצוא Excel: " + e.message + "\nיש להריץ SQL של V34.3 במידת הצורך.");
+      }
+    }
+
+    function renderManager() {
+      page(`
+        ${topBar("דוח מנהלים", `מחובר: ${currentEmployee.name} | גרסה V34.6`)}
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">בחירת תקופה</h2>
+          <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <button type="button" onclick="window.loadReport('today')" class="bg-blue-600 p-4 rounded-2xl font-bold">היום</button>
+            <button type="button" onclick="window.loadReport('yesterday')" class="bg-gray-700 p-4 rounded-2xl font-bold">אתמול</button>
+            <button type="button" onclick="window.loadReport('week')" class="bg-gray-700 p-4 rounded-2xl font-bold">שבוע</button>
+            <button type="button" onclick="window.loadReport('month')" class="bg-gray-700 p-4 rounded-2xl font-bold">חודש</button>
+            <button type="button" onclick="window.loadReport('year')" class="bg-gray-700 p-4 rounded-2xl font-bold">שנה</button>
+          </div>
+          <button type="button" onclick="window.exportExcel()" class="w-full mt-4 bg-green-600 p-4 rounded-2xl font-bold">פתח / הורד Excel</button>
+          <p class="text-gray-400 text-sm mt-3">הדוח מוצג כאן באפליקציה. כפתור Excel יפתח או יוריד את הקובץ לפי הגדרות המכשיר.</p>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">מסך תפ״י — יצירת QR מדוח הזמנות פריוריטי</h2>
+          <p class="text-gray-400 text-sm mb-4">העלה Excel של הזמנות, והמערכת תייצר QR לכל שורה להדבקה על פקודת עבודה. הנתונים נשמרים בטבלת order_lines כדי שבסריקה יופיעו לקוח, שם מוצר ותהליך ייצור. עמודת "תהליך" חלה על הזמנות חדשות בלבד.</p>
+          <input id="ordersExcelFile" type="file" accept=".xlsx,.xls" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700 mb-3">
+          <div class="grid md:grid-cols-2 gap-3">
+            <button onclick="loadOrdersExcelForQR()" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">הצג שורות מהקובץ</button>
+            <button onclick="downloadExcelWithQR()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">הורד Excel עם QR</button>
+          </div>
+          <p id="qrGeneratorMsg" class="text-yellow-300 mt-3"></p>
+          <div id="qrLabelsContainer" class="grid grid-cols-2 md:grid-cols-3 gap-4 mt-5"></div>
+        </section>
+
+
+        <section class="bg-gray-900 border border-pink-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">V34.6 — תפ״י לדפוס</h2>
+          <p class="text-gray-400 text-sm mb-4">בניית פק״ע דפוס, קבצי הדפסה, חישוב מטרים, QR לקובץ הדפסה, PDF גרפי לכל שורה וניהול פק״עות פתוחות/סגורות.</p>
+          <div class="grid md:grid-cols-4 gap-3">
+            <button onclick="renderNewTpiPrintPlanner()" class="w-full bg-pink-700 p-4 rounded-2xl font-bold">פק״ע חדשה</button>
+            <button onclick="renderTpiWorkOrders('open')" class="w-full bg-blue-600 p-4 rounded-2xl font-bold">פק״עות פתוחות</button>
+            <button onclick="renderTpiWorkOrders('closed')" class="w-full bg-gray-700 p-4 rounded-2xl font-bold">פק״עות סגורות</button>
+            <button onclick="exportTpiOpenOrdersExcel()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">Excel תכנון דפוס</button>
+          </div>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5">
+          <h2 class="text-xl font-bold mb-4">ניהול עובדים והרשאות</h2>
+
+          <div class="grid md:grid-cols-4 gap-3 mb-5">
+            <input id="newEmployeeName" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="שם עובד חדש">
+            <input id="newEmployeePassword" type="text" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700" placeholder="סיסמה">
+            <select id="newEmployeeRole" class="w-full p-4 rounded-2xl bg-gray-800 border border-gray-700">
+              <option value="operator">עובד</option>
+              <option value="manager">מנהל</option>
+            </select>
+            <button onclick="createEmployeeAdmin()" class="w-full bg-green-600 p-4 rounded-2xl font-bold">צור עובד</button>
+          </div>
+
+          <p id="employeesMsg" class="text-yellow-300 mb-4"></p>
+
+          <div class="overflow-auto">
+            <table class="w-full text-sm border-collapse">
+              <thead>
+                <tr>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">שם עובד</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">הרשאה</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">סטטוס</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">סיסמה חדשה</th>
+                  <th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">פעולות</th>
+                </tr>
+              </thead>
+              <tbody id="employeesTableBody">
+                <tr><td colspan="5" class="border border-gray-700 p-3 text-gray-400">טוען עובדים...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 mb-5 overflow-auto">
+          <div class="flex items-center justify-between gap-3 mb-4">
+            <h2 class="text-xl font-bold">דוח תוויות גליל</h2>
+            <div class="flex gap-2"><button onclick="loadRollLabelsReport()" class="bg-blue-600 px-4 py-2 rounded-xl font-bold">רענן דוח תוויות</button><button onclick="exportRollLabelsExcel()" class="bg-green-600 px-4 py-2 rounded-xl font-bold">הורד Excel</button></div>
+          </div>
+          <div id="rollLabelsReport" class="text-gray-300">לחץ רענן להצגת תוויות גליל.</div>
+        </section>
+
+        <section class="bg-gray-900 border border-gray-800 rounded-3xl p-5 overflow-auto">
+          <h2 class="text-xl font-bold mb-4">דוח ביצוע</h2>
+          <div id="reportSummary" class="text-gray-300 mb-4">בחר תקופה להצגת דוח</div>
+          <div id="reportTable"></div>
+        </section>`);
+      loadReport("today");
+      refreshEmployeesAdmin();
+      loadRollLabelsReport();
+    }
+
+    async function loadReport(period) {
+      const { start, end } = getDateRange(period);
+      document.getElementById("reportSummary").innerText = "טוען דוח...";
+
+      const { data: jobs, error } = await client
+        .from("jobs")
+        .select("*, employees(name)")
+        .gte("created_at", start)
+        .lte("created_at", end)
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        document.getElementById("reportTable").innerHTML = `<p class="text-red-400">${escapeHtml(error.message)}</p>`;
+        document.getElementById("reportSummary").innerText = "שגיאה בטעינת דוח";
+        return;
+      }
+
+      const jobIds = (jobs || []).map(j => j.id).filter(Boolean);
+      let labelsByJob = {};
+      let qualityByJob = {};
+
+      if (jobIds.length) {
+        const { data: labels, error: labelsError } = await client
+          .from("material_labels")
+          .select("*")
+          .in("job_id", jobIds);
+
+        if (!labelsError && labels) {
+          labels.forEach(label => {
+            if (!labelsByJob[label.job_id]) labelsByJob[label.job_id] = [];
+            labelsByJob[label.job_id].push(label);
+          });
+        }
+
+        const { data: qualityRows, error: qualityError } = await client
+          .from("lamination_quality")
+          .select("*")
+          .in("job_id", jobIds);
+
+        if (!qualityError && qualityRows) {
+          qualityRows.forEach(q => {
+            if (!qualityByJob[q.job_id]) qualityByJob[q.job_id] = q;
+          });
+        }
+      }
+
+      function getLabelUrl(label) {
+        return label.image_url || (label.file_path ? buildPublicLabelUrl(label.file_path) : "");
+      }
+
+      reportRows = (jobs || []).map(job => {
+        const labels = labelsByJob[job.id] || [];
+        const quality = qualityByJob[job.id] || {};
+
+        const startLabels = labels.filter(l => l.label_type === "start").map(getLabelUrl).filter(Boolean);
+        const extraLabels = labels.filter(l => l.label_type !== "start").map(getLabelUrl).filter(Boolean);
+        const allLabelLinks = [...startLabels, ...extraLabels].filter(Boolean);
+
+        return {
+          "תאריך": job.created_at ? new Date(job.created_at).toLocaleDateString("he-IL") : "",
+          "שעת התחלה": job.start_time ? new Date(job.start_time).toLocaleTimeString("he-IL") : "",
+          "שעת סיום": job.end_time ? new Date(job.end_time).toLocaleTimeString("he-IL") : "",
+          "שם מפעיל": job.employees?.name || "",
+          "תהליך": job.department || "למינציה",
+          "פק״ע": job.batch_number || job.order_number || "",
+          "כמות מטרים להעברה": job.transfer_meters || "",
+
+          "כיוון למינט": quality.laminate_direction || "",
+          "התאמת חו״ג לפק״ע": quality.raw_material_match === true ? "כן" : (quality.raw_material_match === false ? "לא" : ""),
+          "עובי": quality.thickness ?? "",
+          "רוחב": quality.width ?? "",
+          "פסיעה": quality.pitch ?? "",
+          "ניקיון הדפסה": quality.print_cleanliness || "",
+          "חומר": quality.material_color || "",
+          "גימור": quality.finish_type || "",
+          "חוזק למינציה": quality.lamination_strength || "",
+          "חוזק הלחמה": quality.sealing_strength || "",
+          "מהירות עבודה": quality.work_speed ?? "",
+          "טמפ׳ תוף": quality.drum_temperature ?? "",
+          "טמפ׳ תוף כניסה": quality.inlet_drum_temperature ?? "",
+          "הערות איכות": quality.comments || "",
+          "אושר איכות": quality.approved === true ? "כן" : (quality.approved === false ? "לא" : ""),
+
+          "מספר תוויות חו״ג": allLabelLinks.length,
+          "תווית חו״ג ראשית": startLabels[0] || allLabelLinks[0] || "",
+          "כל תוויות חו״ג": allLabelLinks.join(" | ")
+        };
+      });
+
+      document.getElementById("reportSummary").innerText = `${currentPeriodName}: נמצאו ${reportRows.length} רשומות`;
+      drawReportTable(reportRows);
+    }
+
+    function drawReportTable(rows) {
+      const cols = ['תאריך', 'שעת התחלה', 'שעת סיום', 'שם מפעיל', 'תהליך', 'פק״ע', 'כמות מטרים להעברה', 'כיוון למינט', 'התאמת חו״ג לפק״ע', 'עובי', 'רוחב', 'פסיעה', 'ניקיון הדפסה', 'חומר', 'גימור', 'חוזק למינציה', 'חוזק הלחמה', 'מהירות עבודה', 'טמפ׳ תוף', 'טמפ׳ תוף כניסה', 'הערות איכות', 'אושר איכות', 'מספר תוויות חו״ג', 'תווית חו״ג ראשית', 'כל תוויות חו״ג'];
+      if (!rows.length) {
+        document.getElementById("reportTable").innerHTML = "אין נתונים לתקופה שנבחרה";
+        return;
+      }
+
+      function renderLabelButtons(value) {
+        const links = String(value || "").split(" | ").filter(Boolean);
+        if (!links.length) return "";
+        return `<div class="flex gap-2 flex-wrap min-w-[220px]">${links.map((url, i) => `
+          <a class="inline-block bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-xl font-bold whitespace-nowrap"
+             href="${url}"
+             target="_blank"
+             rel="noopener noreferrer">
+            פתח תווית ${i + 1}
+          </a>
+        `).join("")}</div>`;
+      }
+
+      function renderCell(col, value, row) {
+        if (col === "תווית חו״ג ראשית") return renderLabelButtons(value);
+        if (col === "כל תוויות חו״ג") return renderLabelButtons(value);
+        return escapeHtml(value || "");
+      }
+
+      document.getElementById("reportTable").innerHTML = `
+        <table class="w-full text-sm border-collapse">
+          <thead><tr>${cols.map(c => `<th class="border border-gray-700 p-2 bg-gray-800 whitespace-nowrap">${c}</th>`).join("")}</tr></thead>
+          <tbody>${rows.map(r => `<tr>${cols.map(c => `<td class="border border-gray-700 p-2 align-top whitespace-nowrap">${renderCell(c, r[c], r)}</td>`).join("")}</tr>`).join("")}</tbody>
+        </table>`;
+    }
+
+    function exportExcel() {
+      if (!reportRows.length) { alert("אין נתונים לייצוא"); return; }
+      const headers = ['תאריך', 'שעת התחלה', 'שעת סיום', 'שם מפעיל', 'תהליך', 'פק״ע', 'כמות מטרים להעברה', 'כיוון למינט', 'התאמת חו״ג לפק״ע', 'עובי', 'רוחב', 'פסיעה', 'ניקיון הדפסה', 'חומר', 'גימור', 'חוזק למינציה', 'חוזק הלחמה', 'מהירות עבודה', 'טמפ׳ תוף', 'טמפ׳ תוף כניסה', 'הערות איכות', 'אושר איכות', 'מספר תוויות חו״ג', 'תווית חו״ג ראשית', 'כל תוויות חו״ג'];
+
+      const excelRows = reportRows.map(row => {
+        const newRow = { ...row };
+        if (newRow["תווית חו״ג ראשית"]) newRow["תווית חו״ג ראשית"] = "פתח תווית ראשית";
+        if (newRow["כל תוויות חו״ג"]) {
+          const count = String(row["כל תוויות חו״ג"]).split(" | ").filter(Boolean).length;
+          newRow["כל תוויות חו״ג"] = `פתח ${count} תוויות`;
+        }
+        return newRow;
+      });
+
+      const ws = XLSX.utils.json_to_sheet(excelRows, { header: headers });
+
+      reportRows.forEach((row, idx) => {
+        const excelRowIndex = idx + 1;
+        const mainUrl = row["תווית חו״ג ראשית"];
+        const allUrls = String(row["כל תוויות חו״ג"] || "").split(" | ").filter(Boolean);
+
+        if (mainUrl) {
+          const cellAddress = XLSX.utils.encode_cell({ r: excelRowIndex, c: headers.indexOf("תווית חו״ג ראשית") });
+          ws[cellAddress] = { t: "s", v: "פתח תווית ראשית", l: { Target: mainUrl, Tooltip: mainUrl } };
+        }
+
+        if (allUrls.length) {
+          const cellAddress = XLSX.utils.encode_cell({ r: excelRowIndex, c: headers.indexOf("כל תוויות חו״ג") });
+          ws[cellAddress] = { t: "s", v: `פתח ${allUrls.length} תוויות`, l: { Target: allUrls[0], Tooltip: allUrls.join(" | ") } };
+        }
+      });
+
+      ws["!cols"] = headers.map(h => h.includes("תווית") ? { wch: 22 } : { wch: 16 });
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "דוח מנהל");
+      const today = new Date().toISOString().slice(0,10);
+      XLSX.writeFile(wb, `digipack-manager-report-${today}.xlsx`);
+    }
+
+    window.createEmployeeAdmin = createEmployeeAdmin;
+    window.updateEmployeePassword = updateEmployeePassword;
+    window.toggleEmployeeActive = toggleEmployeeActive;
+    window.setEmployeeRole = setEmployeeRole;
+    window.refreshEmployeesAdmin = refreshEmployeesAdmin;
+    window.loadReport = loadReport;
+    window.exportExcel = exportExcel;
+    window.clearLoginPassword = clearLoginPassword;
+    window.renderQRScanner = renderQRScanner;
+    window.loadOrdersExcelForQR = loadOrdersExcelForQR;
+    window.downloadExcelWithQR = downloadExcelWithQR;
+    window.useManualQR = useManualQR;
+    window.printQRLabels = printQRLabels;
+    window.copyQRText = copyQRText;
+    window.printSingleQR = printSingleQR;
+    window.addRollInputRow = addRollInputRow;
+    window.openRollLabelsPrint = openRollLabelsPrint;
+    window.renderReprintRollLabelForm = renderReprintRollLabelForm;
+    window.loadRollLabelsReport = loadRollLabelsReport;
+    window.exportRollLabelsExcel = exportRollLabelsExcel;
+    window.printRollLabelFromReport = printRollLabelFromReport;
+    window.loadWorkerRollLabels = loadWorkerRollLabels;
+    window.printWorkerRollLabelCopy = printWorkerRollLabelCopy;
+    window.assignSecondOperatorToRoll = assignSecondOperatorToRoll;
+    window.getProcessText = getProcessText;
+    window.renderLogin = renderLogin;
+
+    window.renderTpiPrintPlanner = renderTpiPrintPlanner;
+    window.renderNewTpiPrintPlanner = renderNewTpiPrintPlanner;
+    window.renderEditTpiOrder = renderEditTpiOrder;
+    window.editTpiLine = editTpiLine;
+    window.editPrintFile = editPrintFile;
+    window.loadTpiOrderLines = loadTpiOrderLines;
+    window.filterTpiOrderLines = filterTpiOrderLines;
+    window.loadOrderLineToTpi = loadOrderLineToTpi;
+    window.importPriorityPdfToTpi = importPriorityPdfToTpi;
+    window.fillTpiLineFormFromImportedLine = fillTpiLineFormFromImportedLine;
+    window.toggleCustomPrintMaterial = toggleCustomPrintMaterial;
+    window.updateTpiPreview = updateTpiPreview;
+    window.addTpiLine = addTpiLine;
+    window.removeTpiLine = removeTpiLine;
+    window.addPrintFilePlan = addPrintFilePlan;
+    window.removePrintFile = removePrintFile;
+    window.saveTpiPrintPlan = saveTpiPrintPlan;
+    window.printTpiFileQrLabels = printTpiFileQrLabels;
+    window.renderPrintWorkStart = renderPrintWorkStart;
+    window.loadPrintFileManual = loadPrintFileManual;
+    window.renderPrintQualityForm = renderPrintQualityForm;
+    window.startPrintJobWithQuality = startPrintJobWithQuality;
+    window.renderFinishPrintJob = renderFinishPrintJob;
+    window.finishPrintJob = finishPrintJob;
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js?v=345");
+    renderLogin();
+  </script>
+</body>
